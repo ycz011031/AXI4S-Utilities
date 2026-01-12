@@ -6,7 +6,7 @@
 module axi4_straddle_convertor #
 (
     parameter integer AXI_TUSER_L        = 161,
-    parameter integer BUFFER_SIZE        = 1024
+    parameter integer BUFFER_SIZE        = 4
 )
 (
     // Global Signals
