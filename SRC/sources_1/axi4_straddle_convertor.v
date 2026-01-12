@@ -1,3 +1,8 @@
+// Hardware test log 1.0: successfully able to compile (at buffer depth = 4) with out major timing violations, successfully run on hardware and was able to detect downstream pcie devices
+// Future work: add xilinx fifo generator integration or BRAM inference for buffer storage to reduce timing violations at higher buffer depths
+`timescale 1ns / 1ps
+//////////////////////////////////////////////////////////////////////////////////
+
 module axi4_straddle_convertor #
 (
     parameter integer AXI_TUSER_L        = 161,
