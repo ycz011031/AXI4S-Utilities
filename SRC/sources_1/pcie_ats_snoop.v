@@ -110,15 +110,15 @@ module pcie_cq_ats_snoop #
                     rq_axis_tdata  <= {AXIS_DATA_WIDTH{1'b0}};
 
                     // === Build Completion Descriptor ===
-                    rq_axis_tdata[78:75]   = 4'b1000;              // Message type
-                    rq_axis_tdata[103:96]  = tag;                  // Copy tag
-                    rq_axis_tdata[111:104] = INV_COMPLETE_CODE;    // Completion message code
-                    rq_axis_tdata[114:112] = 3'b000;               // Routing = 0 (adjust if needed)
+                    rq_axis_tdata[78:75]   <= 4'b1000;              // Message type
+                    rq_axis_tdata[103:96]  <= tag;                  // Copy tag
+                    rq_axis_tdata[111:104] <= INV_COMPLETE_CODE;    // Completion message code
+                    rq_axis_tdata[114:112] <= 3'b000;               // Routing = 0 (adjust if needed)
 
-                    rq_axis_tdata[74:64]   = 11'd1;                // DW count = 1
+                    rq_axis_tdata[74:64]   <= 11'd1;                // DW count = 1
 
-                    rq_axis_tdata[79]      = 1'b0;                 // Poison = 0
-                    rq_axis_tdata[127]     = 1'b0;                 // T9 = 0
+                    rq_axis_tdata[79]      <= 1'b0;                 // Poison = 0
+                    rq_axis_tdata[127]     <= 1'b0;                 // T9 = 0
                 end
             end
         end
