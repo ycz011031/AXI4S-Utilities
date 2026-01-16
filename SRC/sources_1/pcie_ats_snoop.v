@@ -74,7 +74,7 @@ module pcie_cq_ats_snoop #
             ats_msg_code   <= 8'd0;
             ats_msg_routing<= 3'd0;
         end else begin
-            ats_hit <= 1'b0;
+            //ats_hit <= 1'b0;
 
             if (s_axis_tvalid && s_axis_tready) begin
                 if (is_ats_msg) begin
