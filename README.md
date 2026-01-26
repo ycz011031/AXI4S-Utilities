@@ -33,6 +33,22 @@ This README provides an overview of the main Verilog modules found in the `SRC/s
   - `tkeep_byte_to_dword`: Compresses a 64-bit byte TKEEP signal back to 16 bits.
   - Both modules use simple combinational logic for conversion.
 
+### 5. `pcie_ats_snoop`
+- **File:** SRC/sources_1/pcie_ats_snoop.v
+- **Description:**
+  - Monitors PCIe CQ interface for ATS messages.
+  - Extracts and outputs ATS-related fields (e.g., tag, message code, routing).
+  - Transparent AXI-Stream passthrough.
+  - Active-low reset and Start-of-Packet (SOP) detection.
+
+### 6. `pcie_cq_type_counter`
+- **File:** SRC/sources_1/pcie_cq_type_counter.v
+- **Description:**
+  - Counts the number of appearances of each PCIe transaction type on the CQ interface.
+  - Provides 8-bit saturating counters for 16 transaction types (0x0 to 0xF).
+  - Transparent AXI-Stream passthrough.
+  - Active-low reset and Start-of-Packet (SOP) detection.
+
 ---
 
 ## Usage Notes
