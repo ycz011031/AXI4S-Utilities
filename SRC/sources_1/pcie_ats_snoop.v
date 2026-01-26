@@ -54,6 +54,8 @@ module pcie_cq_ats_snoop #
     wire [2:0] routing   = s_axis_tdata[114:112];
     wire [7:0] tag       = s_axis_tdata[103:96];
     wire [3:0] req_type  = s_axis_tdata[78:75];
+    wire [1:0] sop       = s_axis_tuser[81:80]; // Start of Packet indicator
+    wire       is_sop    = (sop != 2'b00);      // SOP when != 0
 
     wire is_message_tlp  = (req_type[3:2] == 2'b10); // Type = 10xx
     wire is_ats_msg      = (req_type == 4'b1110);    // Per PCIe table
@@ -68,7 +70,7 @@ module pcie_cq_ats_snoop #
     // ATS Snooper
     // ============================================================
     always @(posedge clk) begin
-        if (rst) begin
+        if (!rst) begin
             ats_hit        <= 1'b0;
             ats_tag        <= 8'd0;
             ats_msg_code   <= 8'd0;
@@ -76,7 +78,7 @@ module pcie_cq_ats_snoop #
         end else begin
             //ats_hit <= 1'b0;
 
-            if (s_axis_tvalid && s_axis_tready) begin
+            if (s_axis_tvalid && s_axis_tready && is_sop) begin
                 if (is_ats_msg) begin
                     ats_hit         <= 1'b1;
                     ats_tag         <= tag;
@@ -91,7 +93,7 @@ module pcie_cq_ats_snoop #
     // Invalidation Completion Generator (RQ AXIS)
     // ============================================================
     always @(posedge clk) begin
-        if (rst) begin
+        if (!rst) begin
             rq_axis_tvalid <= 1'b0;
             rq_axis_tdata  <= {AXIS_DATA_WIDTH{1'b0}};
             rq_axis_tkeep  <= {AXIS_DATA_WIDTH/8{1'b0}};
@@ -100,7 +102,7 @@ module pcie_cq_ats_snoop #
             rq_axis_tvalid <= 1'b0;
             rq_axis_tlast  <= 1'b0;
 
-            if (s_axis_tvalid && s_axis_tready && is_inv_req) begin
+            if (s_axis_tvalid && s_axis_tready && is_sop && is_inv_req) begin
                 if (rq_axis_tready) begin
                     rq_axis_tvalid <= 1'b1;
                     rq_axis_tlast  <= 1'b1;
