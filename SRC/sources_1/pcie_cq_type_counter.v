@@ -1,7 +1,7 @@
 module pcie_cq_type_counter #
 (
     parameter integer AXIS_DATA_WIDTH = 512,
-    parameter integer AXIS_TUSER_WIDTH = 228
+    parameter integer AXIS_TUSER_WIDTH = 229
 )
 (
     input  wire                          clk,
