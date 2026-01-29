@@ -1,7 +1,8 @@
 module pcie_cq_ats_snoop #
 (
-    parameter integer AXIS_DATA_WIDTH = 512,
-    parameter integer AXIS_TUSER_WIDTH = 229
+    parameter integer AXIS_DATA_WIDTH  = 512,
+    parameter integer AXIS_TUSER_WIDTH = 229,
+    parameter integer RQ_AXIS_TUSER_W  = 183
 )
 (
     input  wire                          clk,
@@ -27,6 +28,7 @@ module pcie_cq_ats_snoop #
     output reg  [AXIS_DATA_WIDTH-1:0]    rq_axis_tdata,
     output reg  [AXIS_DATA_WIDTH/8-1:0]  rq_axis_tkeep,
     output reg                           rq_axis_tvalid,
+    output reg  [RQ_AXIS_TUSER_W-1:0]    rq_axis_tuser,
     input  wire                          rq_axis_tready,
     output reg                           rq_axis_tlast,
 
@@ -76,7 +78,7 @@ module pcie_cq_ats_snoop #
             ats_msg_code   <= 8'd0;
             ats_msg_routing<= 3'd0;
         end else begin
-            //ats_hit <= 1'b0;
+            ats_hit <= 1'b0;
 
             if (s_axis_tvalid && s_axis_tready && is_sop) begin
                 if (is_ats_msg) begin
@@ -85,6 +87,21 @@ module pcie_cq_ats_snoop #
                     ats_msg_code    <= msg_code;
                     ats_msg_routing <= routing;
                 end
+            end
+        end
+    end
+
+    // Status register to track ATS hit
+    reg ats_status;
+
+    always @(posedge clk) begin
+        if (!rst) begin
+            ats_status <= 1'b0;
+        end else begin
+            if (ats_hit) begin
+                ats_status <= 1'b1; // Set status when ATS hit occurs
+            end else if (rq_axis_tready) begin
+                ats_status <= 1'b0; // Clear status when rq_axis_tready is high
             end
         end
     end
@@ -102,26 +119,24 @@ module pcie_cq_ats_snoop #
             rq_axis_tvalid <= 1'b0;
             rq_axis_tlast  <= 1'b0;
 
-            if (s_axis_tvalid && s_axis_tready && is_sop && is_inv_req) begin
-                if (rq_axis_tready) begin
-                    rq_axis_tvalid <= 1'b1;
-                    rq_axis_tlast  <= 1'b1;
+            if (ats_status) begin
+                rq_axis_tvalid <= 1'b1;
+                rq_axis_tlast  <= 1'b1;
 
-                    // only first beat used, single beat TLP
-                    rq_axis_tkeep  <= {AXIS_DATA_WIDTH/8{1'b1}};
-                    rq_axis_tdata  <= {AXIS_DATA_WIDTH{1'b0}};
+                // only first beat used, single beat TLP
+                rq_axis_tkeep  <= {AXIS_DATA_WIDTH/8{1'b1}};
+                rq_axis_tdata  <= {AXIS_DATA_WIDTH{1'b0} };
 
-                    // === Build Completion Descriptor ===
-                    rq_axis_tdata[78:75]   <= 4'b1000;              // Message type
-                    rq_axis_tdata[103:96]  <= tag;                  // Copy tag
-                    rq_axis_tdata[111:104] <= INV_COMPLETE_CODE;    // Completion message code
-                    rq_axis_tdata[114:112] <= 3'b000;               // Routing = 0 (adjust if needed)
+                // === Build Completion Descriptor ===
+                rq_axis_tdata[78:75]   <= 4'b1000;              // Message type
+                rq_axis_tdata[103:96]  <= ats_tag;              // Copy tag
+                rq_axis_tdata[111:104] <= INV_COMPLETE_CODE;    // Completion message code
+                rq_axis_tdata[114:112] <= 3'b000;               // Routing = 0 (adjust if needed)
 
-                    rq_axis_tdata[74:64]   <= 11'd1;                // DW count = 1
+                rq_axis_tdata[74:64]   <= 11'd1;                // DW count = 1
 
-                    rq_axis_tdata[79]      <= 1'b0;                 // Poison = 0
-                    rq_axis_tdata[127]     <= 1'b0;                 // T9 = 0
-                end
+                rq_axis_tdata[79]      <= 1'b0;                 // Poison = 0
+                rq_axis_tdata[127]     <= 1'b0;                 // T9 = 0
             end
         end
     end
