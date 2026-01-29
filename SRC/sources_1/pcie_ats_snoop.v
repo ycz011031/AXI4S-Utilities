@@ -90,22 +90,6 @@ module pcie_cq_ats_snoop #
             end
         end
     end
-
-    // Status register to track ATS hit
-    reg ats_status;
-
-    always @(posedge clk) begin
-        if (!rst) begin
-            ats_status <= 1'b0;
-        end else begin
-            if (ats_hit) begin
-                ats_status <= 1'b1; // Set status when ATS hit occurs
-            end else if (rq_axis_tready) begin
-                ats_status <= 1'b0; // Clear status when rq_axis_tready is high
-            end
-        end
-    end
-
     // ============================================================
     // Invalidation Completion Generator (RQ AXIS)
     // ============================================================
@@ -119,7 +103,7 @@ module pcie_cq_ats_snoop #
             rq_axis_tvalid <= 1'b0;
             rq_axis_tlast  <= 1'b0;
 
-            if (ats_status) begin
+            if (ats_hit) begin
                 rq_axis_tvalid <= 1'b1;
                 rq_axis_tlast  <= 1'b1;
 
@@ -137,6 +121,14 @@ module pcie_cq_ats_snoop #
 
                 rq_axis_tdata[79]      <= 1'b0;                 // Poison = 0
                 rq_axis_tdata[127]     <= 1'b0;                 // T9 = 0
+            end
+            else if (rq_axis_tready) begin
+                rq_axis_tdata  <= {AXIS_DATA_WIDTH{1'b0}};
+                rq_axis_tkeep  <= {AXIS_DATA_WIDTH/8{1'b0}};
+                rq_axis_tuser  <= {RQ_AXIS_TUSER_W{1'b0}};
+                rq_axis_tlast  <= 1'b0;
+                rq_axis_tvalid <= 1'b0;
+
             end
         end
     end
