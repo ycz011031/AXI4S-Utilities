@@ -99,36 +99,42 @@ module pcie_cq_ats_snoop #
             rq_axis_tdata  <= {AXIS_DATA_WIDTH{1'b0}};
             rq_axis_tkeep  <= {AXIS_DATA_WIDTH/8{1'b0}};
             rq_axis_tlast  <= 1'b0;
+            rq_axis_tuser  <= {RQ_AXIS_TUSER_W{1'b0}};
         end else begin
-            rq_axis_tvalid <= 1'b0;
-            rq_axis_tlast  <= 1'b0;
+            if (rq_axis_tvalid && rq_axis_tready) begin
+                rq_axis_tvalid <= 1'b0; 
+                rq_axis_tlast <= 1'b0; 
+                rq_axis_tdata <= {AXIS_DATA_WIDTH{1'b0}}; 
+                rq_axis_tkeep <= {AXIS_DATA_WIDTH/8{1'b0}}; 
+                rq_axis_tuser <= {RQ_AXIS_TUSER_W{1'b0}};
+            end else if (ats_hit) begin
+                rq_axis_tvalid <= 1'b1; 
+                rq_axis_tlast <= 1'b1;
+                rq_axis_tkeep <= 64'h0000_0000_0000_FFFF; // Only first 16 bytes (descriptor) are valid - no payload for messages
+                
+                // RQ TLP TDATA Assignments
+                rq_axis_tdata[74:64]   <= 11'd0; // Dword Count = 0 (no payload for messages)
+                rq_axis_tdata[78:75]   <= 4'b1011; // Request Type = 4'b1011 (Msg - Local, Terminate at Receiver)
+                rq_axis_tdata[79]      <= 1'b0; // Poisoned Request = 0
+                rq_axis_tdata[87:80]   <= 8'd0; // Requester Function/Device Number = 0 (Endpoint mode)
+                rq_axis_tdata[95:88]   <= 8'd0; // Requester Bus Number = 0 (Endpoint mode)
+                rq_axis_tdata[103:96]  <= ats_tag; // Tag - copy from received invalidation request
+                rq_axis_tdata[111:104] <= INV_COMPLETE_CODE; // Message Code - Invalidation Completion code
+                rq_axis_tdata[114:112] <= 3'b000; // Message Routing - Route to Root Complex (0)
+                rq_axis_tdata[119:115] <= 5'd0; // Reserved = 0
+                rq_axis_tdata[120]     <= 1'b0; // Requester ID Enable/T8 = 0 (Endpoint mode)
+                rq_axis_tdata[123:121] <= 3'd0; // Transaction Class = 0
+                rq_axis_tdata[126:124] <= 3'd0; // Attributes = 0 (No Snoop=0, Relaxed Ordering=0, ID-Based Ordering=0)
+                rq_axis_tdata[127]     <= 1'b0; // T9 = 0
 
-            if (ats_hit) begin
-                rq_axis_tvalid <= 1'b1;
-                rq_axis_tlast  <= 1'b1;
-
-                // only first beat used, single beat TLP
-                rq_axis_tkeep  <= {AXIS_DATA_WIDTH/8{1'b1}};
-                rq_axis_tdata  <= {AXIS_DATA_WIDTH{1'b0} };
-
-                // === Build Completion Descriptor ===
-                rq_axis_tdata[78:75]   <= 4'b1000;              // Message type
-                rq_axis_tdata[103:96]  <= ats_tag;              // Copy tag
-                rq_axis_tdata[111:104] <= INV_COMPLETE_CODE;    // Completion message code
-                rq_axis_tdata[114:112] <= 3'b000;               // Routing = 0 (adjust if needed)
-
-                rq_axis_tdata[74:64]   <= 11'd1;                // DW count = 1
-
-                rq_axis_tdata[79]      <= 1'b0;                 // Poison = 0
-                rq_axis_tdata[127]     <= 1'b0;                 // T9 = 0
-            end
-            else if (rq_axis_tready) begin
-                rq_axis_tdata  <= {AXIS_DATA_WIDTH{1'b0}};
-                rq_axis_tkeep  <= {AXIS_DATA_WIDTH/8{1'b0}};
-                rq_axis_tuser  <= {RQ_AXIS_TUSER_W{1'b0}};
-                rq_axis_tlast  <= 1'b0;
-                rq_axis_tvalid <= 1'b0;
-
+                //RQ TLP TUSER Assignments
+                rq_axis_tuser[7:0]     <= 8'h00; // first_be[7:0] = 0 (not applicable for messages)
+                rq_axis_tuser[15:8]    <= 8'h00; // last_be[15:8] = 0 (not applicable for messages)
+                rq_axis_tuser[21:20]   <= 2'b01; // is_sop[21:20] = 01 (single TLP starting at byte lane 0)
+                rq_axis_tuser[23:22]   <= 2'b00; // is_sop0_ptr[23:22] = 00 (starts at byte lane 0)
+                rq_axis_tuser[27:26]   <= 2'b01; // is_eop[27:26] = 01 (single TLP ending)
+                rq_axis_tuser[31:28]   <= 4'd0; // is_eop0_ptr[31:28] = 0 (last Dword offset = 0, descriptor only)
+                rq_axis_tuser[36]      <= 1'b0; // discontinue[36] = 0
             end
         end
     end
