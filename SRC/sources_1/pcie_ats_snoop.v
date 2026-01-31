@@ -113,17 +113,18 @@ module pcie_cq_ats_snoop #
                 rq_axis_tkeep <= 64'h0000_0000_0000_FFFF; // Only first 16 bytes (descriptor) are valid - no payload for messages
                 
                 // RQ TLP TDATA Assignments
-                rq_axis_tdata[74:64]   <= 11'd0; // Dword Count = 0 (no payload for messages)
-                rq_axis_tdata[78:75]   <= 4'b1011; // Request Type = 4'b1011 (Msg - Local, Terminate at Receiver)
+                rq_axis_tdata[63:0]    <= 64'd0; // TODO: DW2 and DW3 content (exclusive for ATS messages)
+                rq_axis_tdata[74:64]   <= 11'd0; // Dword Count = 0 (Verify if this should be d1 for descriptor only)
+                rq_axis_tdata[78:75]   <= 4'b1110; //Request Type = Message (ATS Invalidation Completion)
                 rq_axis_tdata[79]      <= 1'b0; // Poisoned Request = 0
-                rq_axis_tdata[87:80]   <= 8'd0; // Requester Function/Device Number = 0 (Endpoint mode)
-                rq_axis_tdata[95:88]   <= 8'd0; // Requester Bus Number = 0 (Endpoint mode)
+                rq_axis_tdata[87:80]   <= 8'd0; // Requester Function/Device Number = 0 (TODO: Verify against IP)
+                rq_axis_tdata[95:88]   <= 8'd0; // Requester Bus Number = 0 (TODO: Verify against IP)
                 rq_axis_tdata[103:96]  <= ats_tag; // Tag - copy from received invalidation request
-                rq_axis_tdata[111:104] <= INV_COMPLETE_CODE; // Message Code - Invalidation Completion code
-                rq_axis_tdata[114:112] <= 3'b000; // Message Routing - Route to Root Complex (0)
+                rq_axis_tdata[111:104] <= INV_COMPLETE_CODE; // Message Code - Invalidation Completion code TODO: Adjust if needed
+                rq_axis_tdata[114:112] <= 3'b000; // Message Routing - Route to Root Complex (0) TODO: Adjust if needed
                 rq_axis_tdata[119:115] <= 5'd0; // Reserved = 0
-                rq_axis_tdata[120]     <= 1'b0; // Requester ID Enable/T8 = 0 (Endpoint mode)
-                rq_axis_tdata[123:121] <= 3'd0; // Transaction Class = 0
+                rq_axis_tdata[120]     <= 1'b0; // Requester ID Enable/T8 = 0 (TODO: Verify against IP)
+                rq_axis_tdata[123:121] <= 3'd0; // Transaction Class = 0 (TODO: Verify against IP)
                 rq_axis_tdata[126:124] <= 3'd0; // Attributes = 0 (No Snoop=0, Relaxed Ordering=0, ID-Based Ordering=0)
                 rq_axis_tdata[127]     <= 1'b0; // T9 = 0
 
