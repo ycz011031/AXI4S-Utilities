@@ -36,7 +36,10 @@ module pcie_cq_ats_snoop #
     output reg                           ats_hit,       // pulse
     output reg [7:0]                     ats_tag,
     output reg [7:0]                     ats_msg_code,
-    output reg [2:0]                     ats_msg_routing
+    output reg [2:0]                     ats_msg_routing,
+    output reg [AXIS_DATA_WIDTH-1:0]     ats_tdata,
+    output reg [AXIS_DATA_WIDTH/8-1:0]   ats_tkeep,
+    output reg [AXIS_TUSER_WIDTH-1:0]    ats_tuser
 );
 
     // ============================================================
@@ -77,6 +80,9 @@ module pcie_cq_ats_snoop #
             ats_tag        <= 8'd0;
             ats_msg_code   <= 8'd0;
             ats_msg_routing<= 3'd0;
+            ats_tdata      <= {AXIS_DATA_WIDTH{1'b0}};
+            ats_tkeep      <= {AXIS_DATA_WIDTH/8{1'b0}};
+            ats_tuser      <= {AXIS_TUSER_WIDTH{1'b0}};
         end else begin
             ats_hit <= 1'b0;
 
@@ -86,6 +92,9 @@ module pcie_cq_ats_snoop #
                     ats_tag         <= tag;
                     ats_msg_code    <= msg_code;
                     ats_msg_routing <= routing;
+                    ats_tdata       <= s_axis_tdata;
+                    ats_tkeep       <= s_axis_tkeep;
+                    ats_tuser       <= s_axis_tuser;
                 end
             end
         end
@@ -114,14 +123,14 @@ module pcie_cq_ats_snoop #
                 
                 // RQ TLP TDATA Assignments
                 rq_axis_tdata[63:0]    <= 64'd0; // TODO: DW2 and DW3 content (exclusive for ATS messages)
-                rq_axis_tdata[74:64]   <= 11'd0; // Dword Count = 0 (Verify if this should be d1 for descriptor only)
+                rq_axis_tdata[74:64]   <= 11'b00000000010,; // Dword Count = 0 (Copied from UltraScale+ IP example for messages)
                 rq_axis_tdata[78:75]   <= 4'b1110; //Request Type = Message (ATS Invalidation Completion)
                 rq_axis_tdata[79]      <= 1'b0; // Poisoned Request = 0
                 rq_axis_tdata[87:80]   <= 8'd0; // Requester Function/Device Number = 0 (TODO: Verify against IP)
                 rq_axis_tdata[95:88]   <= 8'd0; // Requester Bus Number = 0 (TODO: Verify against IP)
                 rq_axis_tdata[103:96]  <= ats_tag; // Tag - copy from received invalidation request
                 rq_axis_tdata[111:104] <= INV_COMPLETE_CODE; // Message Code - Invalidation Completion code TODO: Adjust if needed
-                rq_axis_tdata[114:112] <= 3'b000; // Message Routing - Route to Root Complex (0) TODO: Adjust if needed
+                rq_axis_tdata[114:112] <= 3'b010; // Message Routing - Route to Root Complex (0) TODO: Adjust if needed
                 rq_axis_tdata[119:115] <= 5'd0; // Reserved = 0
                 rq_axis_tdata[120]     <= 1'b0; // Requester ID Enable/T8 = 0 (TODO: Verify against IP)
                 rq_axis_tdata[123:121] <= 3'd0; // Transaction Class = 0 (TODO: Verify against IP)
@@ -129,7 +138,7 @@ module pcie_cq_ats_snoop #
                 rq_axis_tdata[127]     <= 1'b0; // T9 = 0
 
                 //RQ TLP TUSER Assignments
-                rq_axis_tuser[7:0]     <= 8'h00; // first_be[7:0] = 0 (not applicable for messages)
+                rq_axis_tuser[7:0]     <= 8'h00; // first_be[7:0] = 0 (not applicable for messages) (TODO: Verify)
                 rq_axis_tuser[15:8]    <= 8'h00; // last_be[15:8] = 0 (not applicable for messages)
                 rq_axis_tuser[21:20]   <= 2'b01; // is_sop[21:20] = 01 (single TLP starting at byte lane 0)
                 rq_axis_tuser[23:22]   <= 2'b00; // is_sop0_ptr[23:22] = 00 (starts at byte lane 0)
