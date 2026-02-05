@@ -42,15 +42,7 @@ module pcie_cq_ats_snoop #
     output reg [AXIS_TUSER_WIDTH-1:0]    ats_tuser
 );
 
-    // ============================================================
-    // Pass-through (transparent) path
-    // ============================================================
-    assign m_axis_tdata  = s_axis_tdata;
-    assign m_axis_tkeep  = s_axis_tkeep;
-    assign m_axis_tvalid = s_axis_tvalid;
-    assign m_axis_tlast  = s_axis_tlast;
-    assign m_axis_tuser  = s_axis_tuser;
-    assign s_axis_tready = m_axis_tready;
+
 
     // ============================================================
     // PCIe TLP Field Extraction (CQ descriptor formatting)
@@ -70,6 +62,16 @@ module pcie_cq_ats_snoop #
 
     // invalidation completion code (adjust if needed)
     localparam [7:0] INV_COMPLETE_CODE = 8'h02;
+    
+    // ============================================================
+    // Pass-through (transparent) path
+    // ============================================================
+    assign m_axis_tdata  = s_axis_tdata;
+    assign m_axis_tkeep  = s_axis_tkeep;
+    assign m_axis_tvalid = is_ats_msg ? 1'b0 : s_axis_tvalid;
+    assign m_axis_tlast  = s_axis_tlast;
+    assign m_axis_tuser  = s_axis_tuser;
+    assign s_axis_tready = m_axis_tready;
 
     // ============================================================
     // ATS Snooper
