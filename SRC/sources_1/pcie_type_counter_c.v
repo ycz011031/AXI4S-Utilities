@@ -29,7 +29,7 @@ module pcie_completer_type_counter_unit #
     output wire                           completer_tag_valid,
     input wire [4:0]                     complter_type,
 
-    // Transaction type counters (to ILA)
+    // Transaction type counters (to Hub)
     input  wire                          read_enable,
     output wire [2:0]                    counter_id,
     output reg  [7:0]                    requester_type
