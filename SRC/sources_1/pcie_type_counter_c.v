@@ -103,7 +103,7 @@ module pcie_completer_type_counter_unit #
     // ============================================================
     // Counter Read Logic - Cycle through every 2 cycles
     // ============================================================
-    always_ff @(posedge clk) begin
+    always @(posedge clk) begin
         if (!rst) begin
             counter_index <= 4'd0;
             cycle_toggle <= 1'b0;

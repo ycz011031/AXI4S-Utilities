@@ -113,7 +113,7 @@ module pcie_requester_type_counter_unit #
     // ============================================================
     // Tag Type Lookup Logic
     // ============================================================
-    always_ff @(posedge clk) begin
+    always @(posedge clk) begin
         if (!rst) begin
             complter_type <= 5'b01111;
         end else begin
@@ -128,7 +128,7 @@ module pcie_requester_type_counter_unit #
     // ============================================================
     // Counter Read Logic - Cycle through every 2 cycles
     // ============================================================
-    always_ff @(posedge clk) begin
+    always @(posedge clk) begin
         if (!rst) begin
             counter_index <= 4'd0;
             cycle_toggle <= 1'b0;
