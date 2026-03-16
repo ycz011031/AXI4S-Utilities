@@ -2,7 +2,7 @@ module pcie_completer_type_counter_unit #
 (
     parameter integer AXIS_DATA_WIDTH = 512,
     parameter integer AXIS_TUSER_WIDTH = 81,
-    parameter integer unit_id = 1, // unit_id starts from 1, zero in output indicates idle state
+    parameter integer unit_id = 1// unit_id starts from 1, zero in output indicates idle state
 )
 (
     input  wire                          clk,
