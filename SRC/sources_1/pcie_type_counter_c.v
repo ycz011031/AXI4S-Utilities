@@ -27,7 +27,7 @@ module pcie_completer_type_counter_unit #
     // Tag to requeste type lookup table (to completer counter)
     output wire [7:0]                     completer_tag,
     output wire                           completer_tag_valid,
-    input wire [4:0]                     complter_type,
+    input wire [4:0]                      completer_type,
 
     // Transaction type counters (to Hub)
     input  wire                          read_enable,
@@ -66,7 +66,7 @@ module pcie_completer_type_counter_unit #
     reg       cycle_toggle;
 
     //valid packet delay register
-    reg packet_valid_d;
+    reg completer_valid_d;
 
     assign counter_id = unit_id[2:0]; // Output the unit ID as counter ID (3 bits)
 

@@ -81,12 +81,12 @@ module pcie_type_tracker_top #(
     // Tag lookup interface between CQ and CC units
     wire [7:0]           cq_cc_completer_tag;
     wire                 cq_cc_completer_tag_valid;
-    wire [4:0]           cq_cc_complter_type;
+    wire [4:0]           cq_cc_completer_type;
 
     // Tag lookup interface between RQ and RC units
     wire [7:0]           rq_rc_completer_tag;
     wire                 rq_rc_completer_tag_valid;
-    wire [4:0]           rq_rc_complter_type;
+    wire [4:0]           rq_rc_completer_type;
 
     // Mux for counter_id and requester_type based on channel_select
     wire [2:0] muxed_counter_id = counter_id[channel_select];
@@ -119,7 +119,7 @@ module pcie_type_tracker_top #(
         
         .completer_tag(cq_cc_completer_tag),
         .completer_tag_valid(cq_cc_completer_tag_valid),
-        .complter_type(cq_cc_complter_type),
+        .completer_type(cq_cc_completer_type),
         
         .read_enable(read_enable[0]),
         .counter_id(counter_id[0]),
@@ -153,7 +153,7 @@ module pcie_type_tracker_top #(
         
         .completer_tag(cq_cc_completer_tag),
         .completer_tag_valid(cq_cc_completer_tag_valid),
-        .complter_type(cq_cc_complter_type),
+        .completer_type(cq_cc_completer_type),
         
         .read_enable(read_enable[1]),
         .counter_id(counter_id[1]),
@@ -187,7 +187,7 @@ module pcie_type_tracker_top #(
         
         .completer_tag(rq_rc_completer_tag),
         .completer_tag_valid(rq_rc_completer_tag_valid),
-        .complter_type(rq_rc_complter_type),
+        .completer_type(rq_rc_completer_type),
         
         .read_enable(read_enable[2]),
         .counter_id(counter_id[2]),
@@ -221,7 +221,7 @@ module pcie_type_tracker_top #(
         
         .completer_tag(rq_rc_completer_tag),
         .completer_tag_valid(rq_rc_completer_tag_valid),
-        .complter_type(rq_rc_complter_type),
+        .completer_type(rq_rc_completer_type),
         
         .read_enable(read_enable[3]),
         .counter_id(counter_id[3]),

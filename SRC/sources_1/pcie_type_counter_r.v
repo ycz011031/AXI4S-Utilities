@@ -27,7 +27,7 @@ module pcie_requester_type_counter_unit #
     // Tag to requeste type lookup table (to completer counter)
     input wire [7:0]                     completer_tag,
     input wire                           completer_tag_valid,
-    output reg [4:0]                     complter_type,
+    output reg [4:0]                     completer_type,
 
     // Transaction type counters (to Hub)
     input  wire                          read_enable,
@@ -107,23 +107,17 @@ module pcie_requester_type_counter_unit #
                 type_count_table[req_type] <= type_count_table[req_type] + 1'b1; // Increment count if type matches
                 
             end
-        end
-    end
-
-    // ============================================================
-    // Tag Type Lookup Logic
-    // ============================================================
-    always @(posedge clk) begin
-        if (!rst) begin
-            complter_type <= 5'b01111;
-        end else begin
+            // Ideally we would put this as a dedicated state machine, however this would create multi driver registers in synthesis
+            // In reality this wouldn't be an issue since request and completion would not arrive in the same cycle for the same tag.
             if (completer_tag_valid) begin
                 // Output the table value and reset the entry
-                complter_type <= tag_type_table[completer_tag];
+                completer_type <= tag_type_table[completer_tag];
                 tag_type_table[completer_tag] <= 5'b01111;
             end
         end
     end
+
+
 
     // ============================================================
     // Counter Read Logic - Cycle through every 2 cycles
