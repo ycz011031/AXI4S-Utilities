@@ -1,5 +1,6 @@
 module pcie_type_tracker_top #(
-    parameter integer AXIS_DATA_WIDTH = 512
+    parameter integer AXIS_DATA_WIDTH = 512,
+    parameter integer COUNTER_VALUE_WIDTH = 8  // 8 for uint8, 16 for uint16
 )
 (
     input  wire                          clk,
@@ -66,8 +67,9 @@ module pcie_type_tracker_top #(
     input  wire                          m_axis_rc_tready,
 
     // ILA interface
-    output wire [1:0]                    ila_channel_id,
-    output wire [7:0]                    ila_counter_value
+    output wire [$clog2(NUM_UNITS+1)-1:0] ila_channel_id,
+    output wire [COUNTER_VALUE_WIDTH-1:0] ila_counter_value,
+    output wire                          ila_counter_valid
 );
 
     localparam NUM_UNITS = 4;
@@ -76,7 +78,7 @@ module pcie_type_tracker_top #(
     wire [NUM_UNITS-1:0] read_enable;
     wire [1:0]           channel_select;
     wire [2:0]           counter_id [NUM_UNITS-1:0];
-    wire [7:0]           requester_type [NUM_UNITS-1:0];
+    wire [COUNTER_VALUE_WIDTH-1:0] requester_type [NUM_UNITS-1:0];
 
     // Tag lookup interface between CQ and CC units
     wire [7:0]           cq_cc_completer_tag;
@@ -98,6 +100,7 @@ module pcie_type_tracker_top #(
     pcie_requester_type_counter_unit #(
         .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
         .AXIS_TUSER_WIDTH(229),
+        .COUNTER_VALUE_WIDTH(COUNTER_VALUE_WIDTH),
         .unit_id(1)
     ) cq_requester_unit (
         .clk(clk),
@@ -132,6 +135,7 @@ module pcie_type_tracker_top #(
     pcie_completer_type_counter_unit #(
         .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
         .AXIS_TUSER_WIDTH(81),
+        .COUNTER_VALUE_WIDTH(COUNTER_VALUE_WIDTH),
         .unit_id(2)
     ) cc_completer_unit (
         .clk(clk),
@@ -166,6 +170,7 @@ module pcie_type_tracker_top #(
     pcie_requester_type_counter_unit #(
         .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
         .AXIS_TUSER_WIDTH(137),
+        .COUNTER_VALUE_WIDTH(COUNTER_VALUE_WIDTH),
         .unit_id(3)
     ) rq_requester_unit (
         .clk(clk),
@@ -200,6 +205,7 @@ module pcie_type_tracker_top #(
     pcie_completer_type_counter_unit #(
         .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
         .AXIS_TUSER_WIDTH(161),
+        .COUNTER_VALUE_WIDTH(COUNTER_VALUE_WIDTH),
         .unit_id(4)
     ) rc_completer_unit (
         .clk(clk),
@@ -232,7 +238,8 @@ module pcie_type_tracker_top #(
     // Hub Instance
     // ============================================================
     pcie_type_tracker_hub #(
-        .NUM_UNITS(NUM_UNITS)
+        .NUM_UNITS(NUM_UNITS),
+        .COUNTER_VALUE_WIDTH(COUNTER_VALUE_WIDTH)
     ) hub (
         .clk(clk),
         .rst(rst),
@@ -243,7 +250,8 @@ module pcie_type_tracker_top #(
         .requester_type(muxed_requester_type),
         
         .ila_channel_id(ila_channel_id),
-        .ila_counter_value(ila_counter_value)
+        .ila_counter_value(ila_counter_value),
+        .ila_counter_valid(ila_counter_valid)
     );
 
 endmodule
