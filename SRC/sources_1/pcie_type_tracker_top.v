@@ -67,7 +67,7 @@ module pcie_type_tracker_top #(
     input  wire                          m_axis_rc_tready,
 
     // ILA interface
-    output wire [$clog2(NUM_UNITS+1)-1:0] ila_channel_id,
+    output wire [$clog2(5)-1:0] ila_channel_id,
     output wire [COUNTER_VALUE_WIDTH-1:0] ila_counter_value,
     output wire                          ila_counter_valid
 );
