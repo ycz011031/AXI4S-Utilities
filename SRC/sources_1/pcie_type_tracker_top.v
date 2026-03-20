@@ -92,7 +92,7 @@ module pcie_type_tracker_top #(
 
     // Mux for counter_id and requester_type based on channel_select
     wire [2:0] muxed_counter_id = counter_id[channel_select];
-    wire [7:0] muxed_requester_type = requester_type[channel_select];
+    wire [COUNTER_VALUE_WIDTH-1:0] muxed_requester_type = requester_type[channel_select];
 
     // ============================================================
     // Unit 0: CQ Requester Counter (TUSER=229)
@@ -233,6 +233,177 @@ module pcie_type_tracker_top #(
         .counter_id(counter_id[3]),
         .requester_type(requester_type[3])
     );
+
+    // ============================================================
+    // Hub Instance
+    // ============================================================
+    pcie_type_tracker_hub #(
+        .NUM_UNITS(NUM_UNITS),
+        .COUNTER_VALUE_WIDTH(COUNTER_VALUE_WIDTH)
+    ) hub (
+        .clk(clk),
+        .rst(rst),
+        
+        .read_enable(read_enable),
+        .channel_select(channel_select),
+        .counter_id(muxed_counter_id),
+        .requester_type(muxed_requester_type),
+        
+        .ila_channel_id(ila_channel_id),
+        .ila_counter_value(ila_counter_value),
+        .ila_counter_valid(ila_counter_valid)
+    );
+
+endmodule
+
+// ============================================================
+// 2-Port PCIe Type Tracker Top Module
+// ============================================================
+module pcie_type_tracker_2port #(
+    parameter integer AXIS_DATA_WIDTH = 512,
+    parameter integer COUNTER_VALUE_WIDTH = 8,  // 8 for uint8, 16 for uint16
+    parameter INTERFACE_TYPE = "CQ_CC"  // "CQ_CC" or "RQ_RC"
+)
+(
+    input  wire                          clk,
+    input  wire                          rst,
+
+    // Requester Interface (CQ or RQ depending on INTERFACE_TYPE)
+    input  wire [AXIS_DATA_WIDTH-1:0]    s_axis_req_tdata,
+    input  wire [AXIS_DATA_WIDTH/8-1:0]  s_axis_req_tkeep,
+    input  wire                          s_axis_req_tvalid,
+    input  wire                          s_axis_req_tlast,
+    input  wire [228:0]                  s_axis_req_tuser,  // Max width (CQ=229, RQ=137)
+    output wire                          s_axis_req_tready,
+    
+    output wire [AXIS_DATA_WIDTH-1:0]    m_axis_req_tdata,
+    output wire [AXIS_DATA_WIDTH/8-1:0]  m_axis_req_tkeep,
+    output wire                          m_axis_req_tvalid,
+    output wire                          m_axis_req_tlast,
+    output wire [228:0]                  m_axis_req_tuser,
+    input  wire                          m_axis_req_tready,
+
+    // Completer Interface (CC or RC depending on INTERFACE_TYPE)
+    input  wire [AXIS_DATA_WIDTH-1:0]    s_axis_cpl_tdata,
+    input  wire [AXIS_DATA_WIDTH/8-1:0]  s_axis_cpl_tkeep,
+    input  wire                          s_axis_cpl_tvalid,
+    input  wire                          s_axis_cpl_tlast,
+    input  wire [160:0]                  s_axis_cpl_tuser,  // Max width (CC=81, RC=161)
+    output wire                          s_axis_cpl_tready,
+    
+    output wire [AXIS_DATA_WIDTH-1:0]    m_axis_cpl_tdata,
+    output wire [AXIS_DATA_WIDTH/8-1:0]  m_axis_cpl_tkeep,
+    output wire                          m_axis_cpl_tvalid,
+    output wire                          m_axis_cpl_tlast,
+    output wire [160:0]                  m_axis_cpl_tuser,
+    input  wire                          m_axis_cpl_tready,
+
+    // ILA interface
+    output wire [$clog2(3)-1:0]          ila_channel_id,  // 0=idle, 1=req, 2=cpl
+    output wire [COUNTER_VALUE_WIDTH-1:0] ila_counter_value,
+    output wire                          ila_counter_valid
+);
+
+    localparam NUM_UNITS = 2;
+    
+    // TUSER widths based on interface type
+    localparam REQ_TUSER_WIDTH = (INTERFACE_TYPE == "CQ_CC") ? 229 : 137;
+    localparam CPL_TUSER_WIDTH = (INTERFACE_TYPE == "CQ_CC") ? 81  : 161;
+    
+    // Unit IDs
+    localparam REQ_UNIT_ID = 1;
+    localparam CPL_UNIT_ID = 2;
+
+    // Hub to unit interfaces
+    wire [NUM_UNITS-1:0] read_enable;
+    wire                 channel_select;  // Only 1 bit for 2 units
+    wire [2:0]           counter_id_req, counter_id_cpl;
+    wire [COUNTER_VALUE_WIDTH-1:0] requester_type_req, requester_type_cpl;
+
+    // Tag lookup interface between requester and completer
+    wire [7:0]           completer_tag;
+    wire                 completer_tag_valid;
+    wire [4:0]           completer_type;
+
+    // Mux for counter signals
+    wire [2:0] muxed_counter_id = channel_select ? counter_id_cpl : counter_id_req;
+    wire [COUNTER_VALUE_WIDTH-1:0] muxed_requester_type = channel_select ? requester_type_cpl : requester_type_req;
+
+    // ============================================================
+    // Unit 0: Requester Counter (CQ or RQ)
+    // ============================================================
+    pcie_requester_type_counter_unit #(
+        .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
+        .AXIS_TUSER_WIDTH(REQ_TUSER_WIDTH),
+        .COUNTER_VALUE_WIDTH(COUNTER_VALUE_WIDTH),
+        .unit_id(REQ_UNIT_ID)
+    ) requester_unit (
+        .clk(clk),
+        .rst(rst),
+        
+        .s_axis_tdata(s_axis_req_tdata),
+        .s_axis_tkeep(s_axis_req_tkeep),
+        .s_axis_tvalid(s_axis_req_tvalid),
+        .s_axis_tlast(s_axis_req_tlast),
+        .s_axis_tuser(s_axis_req_tuser[REQ_TUSER_WIDTH-1:0]),
+        .s_axis_tready(s_axis_req_tready),
+        
+        .m_axis_tdata(m_axis_req_tdata),
+        .m_axis_tkeep(m_axis_req_tkeep),
+        .m_axis_tvalid(m_axis_req_tvalid),
+        .m_axis_tlast(m_axis_req_tlast),
+        .m_axis_tuser(m_axis_req_tuser[REQ_TUSER_WIDTH-1:0]),
+        .m_axis_tready(m_axis_req_tready),
+        
+        .completer_tag(completer_tag),
+        .completer_tag_valid(completer_tag_valid),
+        .completer_type(completer_type),
+        
+        .read_enable(read_enable[0]),
+        .counter_id(counter_id_req),
+        .requester_type(requester_type_req)
+    );
+    
+    // Tie off unused upper bits of m_axis_req_tuser
+    assign m_axis_req_tuser[228:REQ_TUSER_WIDTH] = {(229-REQ_TUSER_WIDTH){1'b0}};
+
+    // ============================================================
+    // Unit 1: Completer Counter (CC or RC)
+    // ============================================================
+    pcie_completer_type_counter_unit #(
+        .AXIS_DATA_WIDTH(AXIS_DATA_WIDTH),
+        .AXIS_TUSER_WIDTH(CPL_TUSER_WIDTH),
+        .COUNTER_VALUE_WIDTH(COUNTER_VALUE_WIDTH),
+        .unit_id(CPL_UNIT_ID)
+    ) completer_unit (
+        .clk(clk),
+        .rst(rst),
+        
+        .s_axis_tdata(s_axis_cpl_tdata),
+        .s_axis_tkeep(s_axis_cpl_tkeep),
+        .s_axis_tvalid(s_axis_cpl_tvalid),
+        .s_axis_tlast(s_axis_cpl_tlast),
+        .s_axis_tuser(s_axis_cpl_tuser[CPL_TUSER_WIDTH-1:0]),
+        .s_axis_tready(s_axis_cpl_tready),
+        
+        .m_axis_tdata(m_axis_cpl_tdata),
+        .m_axis_tkeep(m_axis_cpl_tkeep),
+        .m_axis_tvalid(m_axis_cpl_tvalid),
+        .m_axis_tlast(m_axis_cpl_tlast),
+        .m_axis_tuser(m_axis_cpl_tuser[CPL_TUSER_WIDTH-1:0]),
+        .m_axis_tready(m_axis_cpl_tready),
+        
+        .completer_tag(completer_tag),
+        .completer_tag_valid(completer_tag_valid),
+        .completer_type(completer_type),
+        
+        .read_enable(read_enable[1]),
+        .counter_id(counter_id_cpl),
+        .requester_type(requester_type_cpl)
+    );
+    
+    // Tie off unused upper bits of m_axis_cpl_tuser
+    assign m_axis_cpl_tuser[160:CPL_TUSER_WIDTH] = {(161-CPL_TUSER_WIDTH){1'b0}};
 
     // ============================================================
     // Hub Instance
