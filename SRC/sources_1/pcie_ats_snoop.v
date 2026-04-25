@@ -47,15 +47,27 @@ module pcie_cq_ats_snoop #
     // ============================================================
     // PCIe TLP Field Extraction (CQ descriptor formatting)
     // ============================================================
-    wire [7:0] msg_code  = s_axis_tdata[111:104];
-    wire [2:0] routing   = s_axis_tdata[114:112];
-    wire [7:0] tag       = s_axis_tdata[103:96];
-    wire [3:0] req_type  = s_axis_tdata[78:75];
-    wire [1:0] sop       = s_axis_tuser[81:80]; // Start of Packet indicator
-    wire       is_sop    = (sop != 2'b00);      // SOP when != 0
+    // TL Header
+    wire [7:0] tl_hear_byte8 = s_axis_tdata[7:0];       // Device ID's bus number
+    wire [7:0] tl_hear_byte9 = s_axis_tdata[15:8];      // Device ID's function and device number
+    wire [7:0] tl_hear_byte10 = s_axis_tdata[23:16];    // reserved for invalidation request message
+    wire [7:0] tl_hear_byte11 = s_axis_tdata[31:24];    // reserved for invalidation request message
+    wire [7:0] tl_hear_byte12 = s_axis_tdata[39:32];    // reserved for invalidation request message
+    wire [7:0] tl_hear_byte13 = s_axis_tdata[47:40];    // reserved for invalidation request message
+    wire [7:0] tl_hear_byte14 = s_axis_tdata[55:48];    // reserved for invalidation request message
+    wire [7:0] tl_hear_byte15 = s_axis_tdata[63:56];    // reserved for invalidation request message
 
-    wire is_message_tlp  = (req_type[3:2] == 2'b10); // Type = 10xx
-    wire is_ats_msg      = (req_type == 4'b1110);    // Per PCIe table
+    // Xilinx CQ descriptor information
+    wire [15:0] requester_id    = s_axis_tdata[95:80]; // Requester Function/Device Number
+    wire [7:0] msg_code         = s_axis_tdata[111:104];
+    wire [2:0] routing          = s_axis_tdata[114:112];
+    wire [7:0] tag              = s_axis_tdata[103:96];
+    wire [3:0] req_type         = s_axis_tdata[78:75];
+    wire [1:0] sop              = s_axis_tuser[81:80]; // Start of Packet indicator
+    wire       is_sop           = (sop != 2'b00);      // SOP when != 0
+
+    wire is_message_tlp         = (req_type[3:2] == 2'b10); // Type = 10xx
+    wire is_ats_msg             = (req_type == 4'b1110);    // Per PCIe table
 
     // identify invalidation requests (Message Code 0x14 or 0x15)
     wire is_inv_req = (msg_code == 8'h14) || (msg_code == 8'h15);
@@ -76,6 +88,10 @@ module pcie_cq_ats_snoop #
     // ============================================================
     // ATS Snooper
     // ============================================================
+    reg [7:0] inv_tag_r;
+    reg [31:0] inv_itag_r;
+    reg [15:0] inv_reqid_r;
+    reg [7:0] inv_b8_r, inv_b9_r;
     always @(posedge clk) begin
         if (!rst) begin
             ats_hit        <= 1'b0;
@@ -94,7 +110,13 @@ module pcie_cq_ats_snoop #
                 ats_msg_routing <= routing;
                 ats_tdata       <= s_axis_tdata;
                 ats_tkeep       <= s_axis_tkeep;
-                ats_tuser       <= s_axis_tuser;               
+                ats_tuser       <= s_axis_tuser;
+
+                inv_tag_r   <= tag;
+                inv_itag_r  <= (32'h0000_0001 << tag); // Generate iTag vector with a single bit set based on the received tag (TODO: Adjust if needed based on IP requirements)
+                inv_reqid_r <= requester_id;
+                inv_b8_r    <= tl_hear_byte8;
+                inv_b9_r    <= tl_hear_byte9;
             end
             else ats_hit <= 1'b0;
         end
@@ -122,13 +144,14 @@ module pcie_cq_ats_snoop #
                 rq_axis_tkeep <= 64'h0000_0000_0000_FFFF; // Only first 16 bytes (descriptor) are valid - no payload for messages
                 
                 // RQ TLP TDATA Assignments
-                rq_axis_tdata[63:0]    <= {{32{1'b0}},32'h01000096}; // TODO: DW2 and DW3 content (Hard coded now, Destination ID and iTag Vector needs to be dynamically assigned based on received invalidation request)
-                rq_axis_tdata[74:64]   <= 11'd0; // Dword Count = 0 (Completion No Payload)
+                //rq_axis_tdata[63:0]    <= {inv_itag_r[7:0], inv_itag_r[15:8], inv_itag_r[23:16], inv_itag_r[31:24], 16'h0100, inv_reqid_r[7:0], inv_reqid_r[15:8]}; // TODO: DW2 and DW3 content (Hard coded now, Destination ID and iTag Vector needs to be dynamically assigned based on received invalidation request)
+                rq_axis_tdata[63:0]    <= {32'hffffffff, 16'h0100, inv_reqid_r[7:0], inv_reqid_r[15:8]};
+                rq_axis_tdata[74:64]   <= 11'd1; // Dword Count = 0 (Completion No Payload)
                 rq_axis_tdata[78:75]   <= 4'b1110; //Request Type = Message (ATS Invalidation Completion)
                 rq_axis_tdata[79]      <= 1'b0; // Poisoned Request = 0
-                rq_axis_tdata[87:80]   <= 8'h00; // Requester Function/Device Number = 0 (TODO: Hardcoded, needs to be dynamically assigned based on device ID (destination ID) of invalidation request)
-                rq_axis_tdata[95:88]   <= 8'h98; // Requester Bus Number = 0 (TODO: Verify against IP)
-                rq_axis_tdata[103:96]  <= 8'd0; // Tag - copy from received invalidation request
+                rq_axis_tdata[87:80]   <= inv_b9_r; // Requester Function/Device Number = 0 (TODO: Hardcoded, needs to be dynamically assigned based on device ID (destination ID) of invalidation request)
+                rq_axis_tdata[95:88]   <= inv_b8_r; // Requester Bus Number = 0 (TODO: Verify against IP)
+                rq_axis_tdata[103:96]  <= inv_tag_r; // Tag - copy from received invalidation request
                 rq_axis_tdata[111:104] <= INV_COMPLETE_CODE; // Message Code - Invalidation Completion code TODO: Adjust if needed
                 rq_axis_tdata[114:112] <= 3'b010; // Message Routing - Route to Root Complex (0) TODO: Adjust if needed
                 rq_axis_tdata[119:115] <= 5'd0; // Reserved = 0
@@ -140,11 +163,23 @@ module pcie_cq_ats_snoop #
                 //RQ TLP TUSER Assignments
                 rq_axis_tuser[7:0]     <= 8'h00; // first_be[7:0] = 0 (not applicable for messages) (TODO: Verify)
                 rq_axis_tuser[15:8]    <= 8'h00; // last_be[15:8] = 0 (not applicable for messages)
+                rq_axis_tuser[19:16]   <= 4'h0; // addr_offset[3:0]
                 rq_axis_tuser[21:20]   <= 2'b01; // is_sop[21:20] = 01 (single TLP starting at byte lane 0)
                 rq_axis_tuser[23:22]   <= 2'b00; // is_sop0_ptr[23:22] = 00 (starts at byte lane 0)
+                rq_axis_tuser[25:24]   <= 2'b00; // is_sop1_ptr[25:24] = 00 
                 rq_axis_tuser[27:26]   <= 2'b01; // is_eop[27:26] = 01 (single TLP ending)
-                rq_axis_tuser[31:28]   <= 4'd0; // is_eop0_ptr[31:28] = 0 (last Dword offset = 0, descriptor only)
+                rq_axis_tuser[31:28]   <= 4'd3; // is_eop0_ptr[31:28] = 3 (last Dword offset = 3, descriptor only)
+                rq_axis_tuser[35:32]   <= 4'd0; // is_eop1_ptr[35:32] = 0
                 rq_axis_tuser[36]      <= 1'b0; // discontinue[36] = 0
+                rq_axis_tuser[60:37]   <= 24'd0; // reserved = 0
+                rq_axis_tuser[66:61]   <= 6'd0; // seq_num0 = 0
+                rq_axis_tuser[72:67]   <= 6'd0; // seq_num1 = 0
+                rq_axis_tuser[136:73]   <= 64'd0; // parity
+                rq_axis_tuser[137]      <= 1'b0; // PASID TLP Valid 0
+                rq_axis_tuser[138]      <= 1'b0; // PASID TLP Valid 1
+                rq_axis_tuser[158:139] <= 20'd0; // PASID 0
+                rq_axis_tuser[178:159] <= 20'd0; // PASID 1
+                rq_axis_tuser[182:179] <= 4'd0; // reserved
             end
         end
     end
