@@ -36,54 +36,6 @@ module axi4_mwr_batch #(
     output wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser,
     input  wire                          m_axis_tready,
 
-    //FIFO Interface 0
-        //Base Function
-    input  wire                          almost_full_0,
-    input  wire                          almost_empty_0,
-    input  wire                          full_0,
-    input  wire                          empty_0,
-    output wire [AXIS_FIFO_WIDTH -1:0]   fifo_data_in_0,
-    output wire                          wr_en_0,
-    input  wire [AXIS_FIFO_WIDTH -1:0]   fifo_data_out_0,
-    output wire                          rd_en_0,
-        //Additional Signals
-    input wire [5:0]                     data_count_0,
-    input wire [5:0]                     wr_data_count_0,
-    input wire [5:0]                     rd_data_count_0,
-    input wire                           data_valid_0,
-
-    //FIFO Interface 1
-        //Base Function
-    input  wire                          almost_full_1,
-    input  wire                          almost_empty_1,
-    input  wire                          full_1,
-    input  wire                          empty_1,
-    output wire [AXIS_FIFO_WIDTH -1:0]   fifo_data_in_1,
-    output wire                          wr_en_1,
-    input  wire [AXIS_FIFO_WIDTH -1:0]   fifo_data_out_1,
-    output wire                          rd_en_1,
-        //Additional Signals    
-    input wire [5:0]                     data_count_1,
-    input wire [5:0]                     wr_data_count_1,
-    input wire [5:0]                     rd_data_count_1,
-    input wire                           data_valid_1,
-
-    //FIFO Interface 2;    
-        //Base Function
-    input  wire                          almost_full_2,
-    input  wire                          almost_empty_2,
-    input  wire                          full_2,
-    input  wire                          empty_2,
-    output wire [AXIS_FIFO_WIDTH -1:0]   fifo_data_in_2,
-    output wire                          wr_en_2,   
-    input  wire [AXIS_FIFO_WIDTH -1:0]   fifo_data_out_2,
-    output wire                          rd_en_2,
-        //Additional Signals    
-    input wire [5:0]                     data_count_2,
-    input wire [5:0]                     wr_data_count_2,
-    input wire [5:0]                     rd_data_count_2,
-    input wire                           data_valid_2,
-
     //Telemetry
     output reg [TIME_FEDILITY*2-1:0]     Idle_Time,
     output reg [DEPTH_FEDILITY-1:0]      max_burst_depth,
@@ -96,6 +48,185 @@ module axi4_mwr_batch #(
 
 
 
+);
+
+// =================================================================
+// Internal FIFO Signals — instantiated as xpm_fifo_sync below
+// =================================================================
+// Count width: $clog2(FIFO_DEPTH)+1  e.g. 8 bits for FIFO_DEPTH=128
+localparam integer FIFO_CNT_W = $clog2(FIFO_DEPTH) + 1;
+
+// FIFO 0 (ch0 MWr)
+wire                         almost_full_0,  almost_empty_0;
+wire                         full_0,         empty_0;
+wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_in_0; // driven by slave-facing process (assign)
+wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_out_0;// driven by xpm_fifo_sync dout
+wire                         wr_en_0;        // driven by slave-facing process (assign)
+wire                         rd_en_0;        // driven by master interface (assign)
+wire [FIFO_CNT_W-1:0]        wr_data_count_0, rd_data_count_0;
+wire [5:0]                   data_count_0 = wr_data_count_0[5:0]; // 6-bit alias
+wire                         data_valid_0;
+
+// FIFO 1 (ch1 MWr)
+wire                         almost_full_1,  almost_empty_1;
+wire                         full_1,         empty_1;
+wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_in_1;
+wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_out_1;
+wire                         wr_en_1;
+wire                         rd_en_1;
+wire [FIFO_CNT_W-1:0]        wr_data_count_1, rd_data_count_1;
+wire [5:0]                   data_count_1 = wr_data_count_1[5:0];
+wire                         data_valid_1;
+
+// FIFO 2 (non-MWr / pass-through)
+wire                         almost_full_2,  almost_empty_2;
+wire                         full_2,         empty_2;
+wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_in_2;
+wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_out_2;
+wire                         wr_en_2;
+wire                         rd_en_2;
+wire [FIFO_CNT_W-1:0]        wr_data_count_2, rd_data_count_2;
+wire [5:0]                   data_count_2 = wr_data_count_2[5:0];
+wire                         data_valid_2;
+
+// =================================================================
+// Xilinx xpm_fifo_sync Instantiations
+//   READ_MODE       = "fwft"  : First-Word-Fall-Through
+//   FIFO_MEMORY_TYPE= "bram"  : uses block-RAM resources
+//   prog_full       → almost_full_x  (asserts FIFO_DEPTH-4 entries from empty)
+//   prog_empty      → almost_empty_x (asserts at 4 entries)
+//   USE_ADV_FEATURES= "070F" enables:
+//     [0] data_valid  [1] almost_empty  [2] rd_data_count  [3] prog_empty
+//     [8] almost_full [9] wr_data_count [10] prog_full
+// =================================================================
+
+xpm_fifo_sync #(
+    .FIFO_MEMORY_TYPE    ("bram"),
+    .ECC_MODE            ("no_ecc"),
+    .FIFO_WRITE_DEPTH    (FIFO_DEPTH),
+    .WRITE_DATA_WIDTH    (AXIS_FIFO_WIDTH),
+    .WR_DATA_COUNT_WIDTH (FIFO_CNT_W),
+    .PROG_FULL_THRESH    (FIFO_DEPTH - 4),
+    .FULL_RESET_VALUE    (0),
+    .READ_MODE           ("fwft"),
+    .FIFO_READ_LATENCY   (0),
+    .READ_DATA_WIDTH     (AXIS_FIFO_WIDTH),
+    .RD_DATA_COUNT_WIDTH (FIFO_CNT_W),
+    .PROG_EMPTY_THRESH   (4),
+    .DOUT_RESET_VALUE    ("0"),
+    .WAKEUP_TIME         (0),
+    .USE_ADV_FEATURES    ("070F")
+) u_fifo_0 (
+    .sleep         (1'b0),
+    .rst           (~rst_n),
+    .wr_clk        (clk),
+    .wr_en         (wr_en_0),
+    .din           (fifo_data_in_0),
+    .full          (full_0),
+    .prog_full     (almost_full_0),
+    .wr_data_count (wr_data_count_0),
+    .overflow      (),
+    .wr_rst_busy   (),
+    .rd_en         (rd_en_0),
+    .dout          (fifo_data_out_0),
+    .empty         (empty_0),
+    .prog_empty    (almost_empty_0),
+    .rd_data_count (rd_data_count_0),
+    .underflow     (),
+    .rd_rst_busy   (),
+    .data_valid    (data_valid_0),
+    .almost_empty  (),
+    .almost_full   (),
+    .dbiterr       (),
+    .sbiterr       (),
+    .injectdbiterr (1'b0),
+    .injectsbiterr (1'b0)
+);
+
+xpm_fifo_sync #(
+    .FIFO_MEMORY_TYPE    ("bram"),
+    .ECC_MODE            ("no_ecc"),
+    .FIFO_WRITE_DEPTH    (FIFO_DEPTH),
+    .WRITE_DATA_WIDTH    (AXIS_FIFO_WIDTH),
+    .WR_DATA_COUNT_WIDTH (FIFO_CNT_W),
+    .PROG_FULL_THRESH    (FIFO_DEPTH - 4),
+    .FULL_RESET_VALUE    (0),
+    .READ_MODE           ("fwft"),
+    .FIFO_READ_LATENCY   (0),
+    .READ_DATA_WIDTH     (AXIS_FIFO_WIDTH),
+    .RD_DATA_COUNT_WIDTH (FIFO_CNT_W),
+    .PROG_EMPTY_THRESH   (4),
+    .DOUT_RESET_VALUE    ("0"),
+    .WAKEUP_TIME         (0),
+    .USE_ADV_FEATURES    ("070F")
+) u_fifo_1 (
+    .sleep         (1'b0),
+    .rst           (~rst_n),
+    .wr_clk        (clk),
+    .wr_en         (wr_en_1),
+    .din           (fifo_data_in_1),
+    .full          (full_1),
+    .prog_full     (almost_full_1),
+    .wr_data_count (wr_data_count_1),
+    .overflow      (),
+    .wr_rst_busy   (),
+    .rd_en         (rd_en_1),
+    .dout          (fifo_data_out_1),
+    .empty         (empty_1),
+    .prog_empty    (almost_empty_1),
+    .rd_data_count (rd_data_count_1),
+    .underflow     (),
+    .rd_rst_busy   (),
+    .data_valid    (data_valid_1),
+    .almost_empty  (),
+    .almost_full   (),
+    .dbiterr       (),
+    .sbiterr       (),
+    .injectdbiterr (1'b0),
+    .injectsbiterr (1'b0)
+);
+
+xpm_fifo_sync #(
+    .FIFO_MEMORY_TYPE    ("bram"),
+    .ECC_MODE            ("no_ecc"),
+    .FIFO_WRITE_DEPTH    (FIFO_DEPTH),
+    .WRITE_DATA_WIDTH    (AXIS_FIFO_WIDTH),
+    .WR_DATA_COUNT_WIDTH (FIFO_CNT_W),
+    .PROG_FULL_THRESH    (FIFO_DEPTH - 4),
+    .FULL_RESET_VALUE    (0),
+    .READ_MODE           ("fwft"),
+    .FIFO_READ_LATENCY   (0),
+    .READ_DATA_WIDTH     (AXIS_FIFO_WIDTH),
+    .RD_DATA_COUNT_WIDTH (FIFO_CNT_W),
+    .PROG_EMPTY_THRESH   (4),
+    .DOUT_RESET_VALUE    ("0"),
+    .WAKEUP_TIME         (0),
+    .USE_ADV_FEATURES    ("070F")
+) u_fifo_2 (
+    .sleep         (1'b0),
+    .rst           (~rst_n),
+    .wr_clk        (clk),
+    .wr_en         (wr_en_2),
+    .din           (fifo_data_in_2),
+    .full          (full_2),
+    .prog_full     (almost_full_2),
+    .wr_data_count (wr_data_count_2),
+    .overflow      (),
+    .wr_rst_busy   (),
+    .rd_en         (rd_en_2),
+    .dout          (fifo_data_out_2),
+    .empty         (empty_2),
+    .prog_empty    (almost_empty_2),
+    .rd_data_count (rd_data_count_2),
+    .underflow     (),
+    .rd_rst_busy   (),
+    .data_valid    (data_valid_2),
+    .almost_empty  (),
+    .almost_full   (),
+    .dbiterr       (),
+    .sbiterr       (),
+    .injectdbiterr (1'b0),
+    .injectsbiterr (1'b0)
 );
 
 //Decoding Key Values from slave interfaces
