@@ -112,7 +112,7 @@ xpm_fifo_sync #(
     .FIFO_READ_LATENCY   (0),
     .READ_DATA_WIDTH     (AXIS_FIFO_WIDTH),
     .RD_DATA_COUNT_WIDTH (FIFO_CNT_W),
-    .PROG_EMPTY_THRESH   (4),
+    .PROG_EMPTY_THRESH   (5),
     .DOUT_RESET_VALUE    ("0"),
     .WAKEUP_TIME         (0),
     .USE_ADV_FEATURES    ("070F")
@@ -155,7 +155,7 @@ xpm_fifo_sync #(
     .FIFO_READ_LATENCY   (0),
     .READ_DATA_WIDTH     (AXIS_FIFO_WIDTH),
     .RD_DATA_COUNT_WIDTH (FIFO_CNT_W),
-    .PROG_EMPTY_THRESH   (4),
+    .PROG_EMPTY_THRESH   (5),
     .DOUT_RESET_VALUE    ("0"),
     .WAKEUP_TIME         (0),
     .USE_ADV_FEATURES    ("070F")
@@ -198,7 +198,7 @@ xpm_fifo_sync #(
     .FIFO_READ_LATENCY   (0),
     .READ_DATA_WIDTH     (AXIS_FIFO_WIDTH),
     .RD_DATA_COUNT_WIDTH (FIFO_CNT_W),
-    .PROG_EMPTY_THRESH   (4),
+    .PROG_EMPTY_THRESH   (5),
     .DOUT_RESET_VALUE    ("0"),
     .WAKEUP_TIME         (0),
     .USE_ADV_FEATURES    ("070F")
