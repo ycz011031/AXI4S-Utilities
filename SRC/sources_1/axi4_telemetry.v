@@ -23,8 +23,6 @@ module axi4_telemetry #(
     output reg [3:0]                     tel_pkt_type,    // Request type field [78:75]
     output reg [31:0]                    tel_pkt_addr,    // MSB 32 bits of address (MWr/MRd only)
     output reg [DATA_FIDELITY-1:0]       tel_payload_dw,  // Payload size in DWORDs (MWr only)
-    output reg                           tel_is_sop,      // SOP marker for current packet
-    output reg                           tel_is_eop,      // EOP marker for current packet
     
     // Additional telemetry for PCIe characterization
     output reg [7:0]                     tel_pkt_tag,     // PCIe tag [103:96]
@@ -284,8 +282,6 @@ always @(posedge clk or negedge rst_n) begin
         tel_pkt_type     <= 4'd0;
         tel_pkt_addr     <= 32'd0;
         tel_payload_dw   <= {DATA_FIDELITY{1'b0}};
-        tel_is_sop       <= 1'b0;
-        tel_is_eop       <= 1'b0;
         tel_pkt_tag      <= 8'd0;
         tel_addr_type    <= 2'd0;
         tel_total_pkts   <= {DATA_FIDELITY{1'b0}};
@@ -330,8 +326,6 @@ always @(posedge clk or negedge rst_n) begin
                     tel_payload_dw  <= mem_payload_dw[r_read_ptr];
                     tel_pkt_tag     <= mem_pkt_tag[r_read_ptr];
                     tel_addr_type   <= mem_addr_type[r_read_ptr];
-                    tel_is_sop      <= 1'b1;
-                    tel_is_eop      <= 1'b0;
                 end else begin
                     // No more valid data, output zeros
                     tel_pkt_length  <= {DATA_FIDELITY{1'b0}};
@@ -341,8 +335,6 @@ always @(posedge clk or negedge rst_n) begin
                     tel_payload_dw  <= {DATA_FIDELITY{1'b0}};
                     tel_pkt_tag     <= 8'd0;
                     tel_addr_type   <= 2'd0;
-                    tel_is_sop      <= 1'b0;
-                    tel_is_eop      <= 1'b0;
                 end
                 
                 // Statistics (constant during streaming)
@@ -361,8 +353,6 @@ always @(posedge clk or negedge rst_n) begin
             ST_STREAM_V2: begin
                 tel_enable    <= 1'b1;
                 tel_valid     <= 1'b1;
-                tel_is_sop    <= 1'b0;
-                tel_is_eop    <= 1'b1;
                 
                 r_stream_state   <= ST_STREAM_I1;
                 r_stream_counter <= r_stream_counter + 1'b1;
