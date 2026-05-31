@@ -7,13 +7,21 @@ module axi4_telemetry #(
     input wire                          clk,
     input wire                          rst_n,
 
-    // AXI4-Stream Monitor Interface (passive tap)
+    // AXI4-Stream Slave Interface (input)
     input  wire [AXIS_DATA_WIDTH-1:0]    s_axis_tdata,
     input  wire [AXIS_DATA_WIDTH/8-1:0]  s_axis_tkeep,
     input  wire                          s_axis_tvalid,
     input  wire                          s_axis_tlast,
     input  wire [AXIS_TUSER_WIDTH-1:0]   s_axis_tuser,
-    input  wire                          s_axis_tready,
+    output wire                          s_axis_tready,
+
+    // AXI4-Stream Master Interface (transparent passthrough)
+    output wire [AXIS_DATA_WIDTH-1:0]    m_axis_tdata,
+    output wire [AXIS_DATA_WIDTH/8-1:0]  m_axis_tkeep,
+    output wire                          m_axis_tvalid,
+    output wire                          m_axis_tlast,
+    output wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser,
+    input  wire                          m_axis_tready,
 
     // Telemetry Data Output (for ILA capture)
     output reg                           tel_enable,      // High during streaming window
@@ -32,6 +40,16 @@ module axi4_telemetry #(
     output reg [DATA_FIDELITY-1:0]       tel_mrd_count,   // MRd packets in this buffer
     output reg [DATA_FIDELITY-1:0]       tel_other_count  // Other packet types in this buffer
 );
+
+// =================================================================
+// Transparent AXI4-Stream Passthrough
+// =================================================================
+assign m_axis_tdata  = s_axis_tdata;
+assign m_axis_tkeep  = s_axis_tkeep;
+assign m_axis_tvalid = s_axis_tvalid;
+assign m_axis_tlast  = s_axis_tlast;
+assign m_axis_tuser  = s_axis_tuser;
+assign s_axis_tready = m_axis_tready;
 
 // =================================================================
 // Local Parameters
@@ -77,8 +95,8 @@ assign eop          = s_axis_tuser[87:86];
 assign eop_ptr      = s_axis_tuser[91:88];
 assign dword_count  = s_axis_tdata[73:64];  // DW count field for MWr/MRd
 
-// Transaction handshake
-wire beat_fire = s_axis_tvalid && s_axis_tready;
+// Transaction handshake (monitoring the passthrough)
+wire beat_fire = s_axis_tvalid && m_axis_tready;
 wire is_sop    = beat_fire && sop[0];
 wire is_eop    = beat_fire && s_axis_tlast;
 
