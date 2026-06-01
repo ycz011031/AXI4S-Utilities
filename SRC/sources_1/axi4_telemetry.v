@@ -1,8 +1,9 @@
 module axi4_telemetry #(
     parameter integer AXIS_DATA_WIDTH  = 512,
     parameter integer AXIS_TUSER_WIDTH = 183,
-    parameter integer TELEMETRY_DEPTH  = 512,  // Depth: 512 packets (increased from 256 for better characterization)
-    parameter integer DATA_FIDELITY    = 8     // Max value bits for length/gap counters (default 8 = max 255)
+    parameter integer TELEMETRY_DEPTH  = 512,  // Depth: number of packets to buffer
+    parameter integer DATA_FIDELITY    = 8,    // Max value bits for length/gap counters (default 8 = max 255)
+    parameter integer ILA_DEPTH        = 0     // ILA sample depth (0 = auto-set to STREAM_DURATION)
 )(
     input wire                          clk,
     input wire                          rst_n,
@@ -21,24 +22,7 @@ module axi4_telemetry #(
     output wire                          m_axis_tvalid,
     output wire                          m_axis_tlast,
     output wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser,
-    input  wire                          m_axis_tready,
-
-    // Telemetry Data Output (for ILA capture)
-    output reg                           tel_enable,      // High during streaming window
-    output reg                           tel_valid,       // High when data is valid (2-cycle pattern)
-    output reg [DATA_FIDELITY-1:0]       tel_pkt_length,  // Packet length in beats
-    output reg [DATA_FIDELITY-1:0]       tel_pkt_gap,     // Gap between packets in cycles
-    output reg [3:0]                     tel_pkt_type,    // Request type field [78:75]
-    output reg [31:0]                    tel_pkt_addr,    // MSB 32 bits of address (MWr/MRd only)
-    output reg [DATA_FIDELITY-1:0]       tel_payload_dw,  // Payload size in DWORDs (MWr only)
-    
-    // Additional telemetry for PCIe characterization
-    output reg [7:0]                     tel_pkt_tag,     // PCIe tag [103:96]
-    output reg [1:0]                     tel_addr_type,   // Address type [1:0]
-    output reg [DATA_FIDELITY-1:0]       tel_total_pkts,  // Total packets seen (saturating)
-    output reg [DATA_FIDELITY-1:0]       tel_mwr_count,   // MWr packets in this buffer
-    output reg [DATA_FIDELITY-1:0]       tel_mrd_count,   // MRd packets in this buffer
-    output reg [DATA_FIDELITY-1:0]       tel_other_count  // Other packet types in this buffer
+    input  wire                          m_axis_tready
 );
 
 // =================================================================
@@ -61,16 +45,23 @@ localparam MRD_TYPE = 4'b0000;
 localparam ADDR_WIDTH = $clog2(TELEMETRY_DEPTH);
 
 // Streaming state machine
-localparam [2:0] ST_COLLECT     = 3'd0;  // Collecting telemetry data
-localparam [2:0] ST_WAIT_STREAM = 3'd1;  // Waiting for stream interval
-localparam [2:0] ST_STREAM_V1   = 3'd2;  // Streaming cycle 1 (valid high)
-localparam [2:0] ST_STREAM_V2   = 3'd3;  // Streaming cycle 2 (valid high)
-localparam [2:0] ST_STREAM_I1   = 3'd4;  // Streaming cycle 3 (valid low)
-localparam [2:0] ST_STREAM_I2   = 3'd5;  // Streaming cycle 4 (valid low)
+localparam [2:0] ST_COLLECT   = 3'd0;  // Collecting telemetry data (and gap before streaming)
+localparam [2:0] ST_STREAM_V1 = 3'd1;  // Streaming cycle 1 (valid high)
+localparam [2:0] ST_STREAM_V2 = 3'd2;  // Streaming cycle 2 (valid high)
+localparam [2:0] ST_STREAM_I1 = 3'd3;  // Streaming cycle 3 (valid low)
+localparam [2:0] ST_STREAM_I2 = 3'd4;  // Streaming cycle 4 (valid low)
 
-// Timing constants
-localparam STREAM_DURATION = 1024;  // Total streaming window (256 pkts × 4 cycles/pkt)
-localparam STREAM_GAP      = 8192;  // Gap between streaming windows
+// Timing constants (auto-calculated from TELEMETRY_DEPTH)
+localparam STREAM_DURATION = TELEMETRY_DEPTH * 4;  // 4 cycles per packet (2 valid + 2 invalid)
+localparam STREAM_GAP      = STREAM_DURATION * 8;  // Gap is 8x the streaming duration
+
+// ILA sample depth (auto-set to stream duration if not specified)
+localparam ACTUAL_ILA_DEPTH = (ILA_DEPTH == 0) ? STREAM_DURATION : ILA_DEPTH;
+
+// Note: With default TELEMETRY_DEPTH=512:
+//   STREAM_DURATION  = 2048 cycles
+//   STREAM_GAP       = 16384 cycles
+//   ACTUAL_ILA_DEPTH = 2048 samples (captures one complete streaming window)
 
 // =================================================================
 // Packet Field Decoding (from tdata/tuser)
@@ -145,8 +136,23 @@ reg [DATA_FIDELITY-1:0]  r_buf_other_count;  // Other types in current buffer
 
 // Streaming control
 reg [2:0]                r_stream_state;
-reg [12:0]               r_stream_counter;   // Counts cycles within streaming/gap phases (13 bits for 8192)
+reg [15:0]               r_stream_counter;   // Counts cycles within streaming/gap phases (16 bits to handle larger depths)
 reg [ADDR_WIDTH-1:0]     r_stream_pkt_cnt;   // Packet counter during streaming
+
+// Telemetry output registers (internal, captured by ILA)
+reg                      tel_enable;         // High during streaming window
+reg                      tel_valid;          // High when data is valid (2-cycle pattern)
+reg [DATA_FIDELITY-1:0]  tel_pkt_length;     // Packet length in beats
+reg [DATA_FIDELITY-1:0]  tel_pkt_gap;        // Gap between packets in cycles
+reg [3:0]                tel_pkt_type;       // Request type field [78:75]
+reg [31:0]               tel_pkt_addr;       // MSB 32 bits of address (MWr/MRd only)
+reg [DATA_FIDELITY-1:0]  tel_payload_dw;     // Payload size in DWORDs (MWr only)
+reg [7:0]                tel_pkt_tag;        // PCIe tag [103:96]
+reg [1:0]                tel_addr_type;      // Address type [1:0]
+reg [DATA_FIDELITY-1:0]  tel_total_pkts;     // Total packets seen (saturating)
+reg [DATA_FIDELITY-1:0]  tel_mwr_count;      // MWr packets in this buffer
+reg [DATA_FIDELITY-1:0]  tel_mrd_count;      // MRd packets in this buffer
+reg [DATA_FIDELITY-1:0]  tel_other_count;    // Other packet types in this buffer
 
 // =================================================================
 // Packet Collection Process
@@ -289,8 +295,8 @@ end
 // =================================================================
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        r_stream_state   <= ST_WAIT_STREAM;
-        r_stream_counter <= 13'd0;
+        r_stream_state   <= ST_COLLECT;
+        r_stream_counter <= 16'd0;
         r_stream_pkt_cnt <= {ADDR_WIDTH{1'b0}};
         r_read_ptr       <= {ADDR_WIDTH{1'b0}};
         tel_enable       <= 1'b0;
@@ -322,7 +328,7 @@ always @(posedge clk or negedge rst_n) begin
                 end else begin
                     // Start streaming
                     r_stream_state   <= ST_STREAM_V1;
-                    r_stream_counter <= 13'd0;
+                    r_stream_counter <= 16'd0;
                     r_stream_pkt_cnt <= {ADDR_WIDTH{1'b0}};
                     r_read_ptr       <= r_write_ptr - r_valid_count;  // Start from oldest entry
                 end
@@ -398,10 +404,10 @@ always @(posedge clk or negedge rst_n) begin
                 r_stream_pkt_cnt <= r_stream_pkt_cnt + 1'b1;
                 r_stream_counter <= r_stream_counter + 1'b1;
                 
-                // Check if streaming window complete (1024 cycles)
+                // Check if streaming window complete
                 if (r_stream_counter >= (STREAM_DURATION - 1)) begin
                     r_stream_state   <= ST_COLLECT;
-                    r_stream_counter <= 13'd0;
+                    r_stream_counter <= 16'd0;
                 end else begin
                     r_stream_state <= ST_STREAM_V1;
                 end
@@ -414,5 +420,54 @@ always @(posedge clk or negedge rst_n) begin
         endcase
     end
 end
+
+// =================================================================
+// Integrated Logic Analyzer (ILA) for Debug
+// Each signal has a dedicated probe for easy viewing and independent triggering
+// =================================================================
+
+// ILA IP Core Instantiation
+// Configuration:
+//   - 20 individual probes (one per signal)
+//   - Sample depth: ACTUAL_ILA_DEPTH (defaults to STREAM_DURATION)
+//   - Each probe has its own comparator for flexible triggering
+//
+// Create with Vivado TCL:
+//   See comments below for automated IP generation script
+
+ila_0 u_ila_telemetry (
+    .clk     (clk),
+    
+    // Control & Status Signals
+    .probe0  (rst_n),              // [0:0]   System reset
+    .probe1  (tel_enable),         // [0:0]   Streaming window active
+    .probe2  (tel_valid),          // [0:0]   Data valid flag
+    .probe3  (r_gap_active),       // [0:0]   Counting gap between packets
+    .probe4  (r_in_packet),        // [0:0]   Currently in packet
+    
+    // State Machine & Counters
+    .probe5  (r_stream_state),     // [2:0]   Stream state machine
+    .probe6  (r_stream_counter),   // [15:0]  Stream/gap cycle counter
+    
+    // Packet Telemetry Data
+    .probe7  (tel_pkt_length),     // [7:0]   Packet length in beats
+    .probe8  (tel_pkt_gap),        // [7:0]   Gap between packets (cycles)
+    .probe9  (tel_pkt_type),       // [3:0]   PCIe request type
+    .probe10 (tel_pkt_addr),       // [31:0]  Packet address (MSB 32 bits)
+    .probe11 (tel_payload_dw),     // [7:0]   Payload size in DWORDs
+    .probe12 (tel_pkt_tag),        // [7:0]   PCIe transaction tag
+    .probe13 (tel_addr_type),      // [1:0]   Address type
+    
+    // Statistics
+    .probe14 (tel_total_pkts),     // [7:0]   Total packets seen (saturating)
+    .probe15 (tel_mwr_count),      // [7:0]   MWr packet count in buffer
+    .probe16 (tel_mrd_count),      // [7:0]   MRd packet count in buffer
+    .probe17 (tel_other_count),    // [7:0]   Other packet types in buffer
+    
+    // Internal Buffer State
+    .probe18 (r_valid_count),      // [8:0]   Valid entries in buffer (max 512)
+    .probe19 (r_write_ptr)         // [8:0]   Current write pointer
+);
+
 
 endmodule
