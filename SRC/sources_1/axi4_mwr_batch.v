@@ -34,20 +34,13 @@ module axi4_mwr_batch #(
     output wire                          m_axis_tvalid,
     output wire                          m_axis_tlast,
     output wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser,
-    input  wire                          m_axis_tready,
-
-    //Telemetry
-    output reg [TIME_FEDILITY*2-1:0]     Idle_Time,
-    output reg [DEPTH_FEDILITY-1:0]      max_burst_depth,
-    output reg                           msg_conflict_detected,
-
-    // 2-bit priority per FIFO: [0] = timeout reached, [1] = depth reached
-    output reg [1:0]                     priority_0,
-    output reg [1:0]                     priority_1,
-    output reg [1:0]                     priority_2
-
-
-
+    input  wire                          m_axis_tready
+    //
+    // NOTE: Per-packet telemetry (length, gap, type, address, tag, counts)
+    // is collected externally by the axi4_telemetry passthrough module on the
+    // master stream, so this module no longer exports telemetry ports.
+    // time_threshold / depth_threshold are retained: they drive the internal
+    // batching priority (timeout / depth triggers) used by the arbiter.
 );
 
 // =================================================================
@@ -55,6 +48,25 @@ module axi4_mwr_batch #(
 // =================================================================
 // Count width: $clog2(FIFO_DEPTH)+1  e.g. 8 bits for FIFO_DEPTH=128
 localparam integer FIFO_CNT_W = $clog2(FIFO_DEPTH) + 1;
+
+// -----------------------------------------------------------------------------
+// prog_full (almost_full) backpressure headroom.
+//
+// Writes in this module are *registered* (wr_en/din come from r_wr_en_x_r /
+// r_fifo_din), so an accepted beat commits to the FIFO one cycle after the
+// AXI-S handshake.  prog_full itself also has assertion latency.  If flow
+// control gated on raw `full`, that pipeline delay would let extra beats be
+// accepted after the FIFO had no room, and the trailing writes would overflow
+// and be silently dropped.
+//
+// We instead deassert s_axis_tready on prog_full, reserving PROG_FULL_HEADROOM
+// empty slots.  Minimum required for lossless operation is ~3 (registered
+// write + prog_full latency).  We extend it to the longest in-flight packet so
+// that a packet which has already started can always stream to completion
+// without the FIFO ever overflowing — i.e. flow control at packet granularity.
+// -----------------------------------------------------------------------------
+localparam integer PROG_FULL_HEADROOM = 16;
+localparam integer PROG_FULL_THRESH_C = FIFO_DEPTH - PROG_FULL_HEADROOM;
 
 // FIFO 0 (ch0 MWr)
 wire                         almost_full_0,  almost_empty_0;
@@ -93,7 +105,8 @@ wire                         data_valid_2;
 // Xilinx xpm_fifo_sync Instantiations
 //   READ_MODE       = "fwft"  : First-Word-Fall-Through
 //   FIFO_MEMORY_TYPE= "bram"  : uses block-RAM resources
-//   prog_full       → almost_full_x  (asserts FIFO_DEPTH-4 entries from empty)
+//   prog_full       → almost_full_x  (asserts at FIFO_DEPTH-PROG_FULL_HEADROOM
+//                                      entries; drives s_axis_tready backpressure)
 //   prog_empty      → almost_empty_x (asserts at 4 entries)
 //   USE_ADV_FEATURES= "070F" enables:
 //     [0] data_valid  [1] almost_empty  [2] rd_data_count  [3] prog_empty
@@ -106,7 +119,7 @@ xpm_fifo_sync #(
     .FIFO_WRITE_DEPTH    (FIFO_DEPTH),
     .WRITE_DATA_WIDTH    (AXIS_FIFO_WIDTH),
     .WR_DATA_COUNT_WIDTH (FIFO_CNT_W),
-    .PROG_FULL_THRESH    (FIFO_DEPTH - 5),
+    .PROG_FULL_THRESH    (PROG_FULL_THRESH_C),
     .FULL_RESET_VALUE    (0),
     .READ_MODE           ("fwft"),
     .FIFO_READ_LATENCY   (0),
@@ -149,7 +162,7 @@ xpm_fifo_sync #(
     .FIFO_WRITE_DEPTH    (FIFO_DEPTH),
     .WRITE_DATA_WIDTH    (AXIS_FIFO_WIDTH),
     .WR_DATA_COUNT_WIDTH (FIFO_CNT_W),
-    .PROG_FULL_THRESH    (FIFO_DEPTH - 5),
+    .PROG_FULL_THRESH    (PROG_FULL_THRESH_C),
     .FULL_RESET_VALUE    (0),
     .READ_MODE           ("fwft"),
     .FIFO_READ_LATENCY   (0),
@@ -192,7 +205,7 @@ xpm_fifo_sync #(
     .FIFO_WRITE_DEPTH    (FIFO_DEPTH),
     .WRITE_DATA_WIDTH    (AXIS_FIFO_WIDTH),
     .WR_DATA_COUNT_WIDTH (FIFO_CNT_W),
-    .PROG_FULL_THRESH    (FIFO_DEPTH - 5),
+    .PROG_FULL_THRESH    (PROG_FULL_THRESH_C),
     .FULL_RESET_VALUE    (0),
     .READ_MODE           ("fwft"),
     .FIFO_READ_LATENCY   (0),
@@ -306,18 +319,28 @@ wire is_mwr_1 = (request_type_1 == MWR_TYPE);
 // =================================================================
 // Ready Signals — Combinatorial, Type-Aware
 //
-//  MWr path  (type 0001): ready when the dedicated FIFO (0 or 1) is not full.
-//  Non-MWr path          : ready when FIFO 2 is not full AND the one-beat
-//                          cache is empty (cache full ⇒ FIFO 2 still draining).
+//  Backpressure gates on almost_full (prog_full), NOT raw full.  Because the
+//  write path is registered (accepted beat commits one cycle later) and
+//  prog_full has its own assertion latency, gating on full would let beats be
+//  accepted into a FIFO that has no room by the time the registered write
+//  commits — those writes overflow and are dropped.  prog_full reserves
+//  PROG_FULL_HEADROOM slots so every accepted beat is guaranteed a landing
+//  spot, and a started packet can stream to EOP without overflow.
+//
+//  MWr path  (type 0001): ready when the dedicated FIFO (0 or 1) is not
+//                          almost-full.
+//  Non-MWr path          : ready when FIFO 2 is not almost-full AND the
+//                          one-beat cache is empty (cache full ⇒ FIFO 2 still
+//                          draining).
 //  valid=0               : assert ready optimistically; the correct gate will
 //                          fire on the cycle valid is presented.
 // =================================================================
 wire s_tready_0_w = s_axis_tvalid_0
-    ? (is_mwr_0 ? !full_0 : (!full_2 && !r_cache2_valid))
+    ? (is_mwr_0 ? !almost_full_0 : (!almost_full_2 && !r_cache2_valid))
     : 1'b1;
 
 wire s_tready_1_w = s_axis_tvalid_1
-    ? (is_mwr_1 ? !full_1 : (!full_2 && !r_cache2_valid))
+    ? (is_mwr_1 ? !almost_full_1 : (!almost_full_2 && !r_cache2_valid))
     : 1'b1;
 
 assign s_axis_tready_0 = s_tready_0_w;
@@ -357,6 +380,13 @@ localparam [1:0] MST_SERVE_2 = 2'd3;   // transmitting a packet from FIFO 2 (non
 reg [1:0] r_mst_state;
 reg [7:0] r_wait_0;    // cycles FIFO 0 has been triggered-but-not-served (saturates at 8'hFF)
 reg [7:0] r_wait_1;    // same for FIFO 1
+
+// --- Packet-in-flight flag (master side) ---
+// 1 = a packet has begun transmission (a non-EOP beat was accepted) and its
+//     EOP has not yet been accepted.  Used so the FSM can safely re-arbitrate
+//     out of a SERVE state when its FIFO drains *between* packets, while still
+//     holding the state across a mid-packet underrun bubble.
+reg       r_in_pkt;
 
 // --- Mux current FIFO data/empty based on active state ---
 // FIFO packing: { tlast[1], sop[1], tuser[AXIS_TUSER_WIDTH], tdata[AXIS_DATA_WIDTH] }
@@ -440,7 +470,6 @@ always @(posedge clk or negedge rst_n) begin
         r_cache2_data         <= {AXIS_FIFO_WIDTH{1'b0}};
         r_cache2_valid        <= 1'b0;
         r_cache2_ch           <= 1'b0;
-        msg_conflict_detected <= 1'b0;
     end else begin
 
         // ----------------------------------------------------------
@@ -449,7 +478,6 @@ always @(posedge clk or negedge rst_n) begin
         r_wr_en_0_r           <= 1'b0;
         r_wr_en_1_r           <= 1'b0;
         r_wr_en_2_r           <= 1'b0;
-        msg_conflict_detected <= 1'b0;  // single-cycle telemetry pulse
 
         // ----------------------------------------------------------
         // FIFO 0 — MWr beats from channel 0
@@ -506,110 +534,60 @@ always @(posedge clk or negedge rst_n) begin
             r_cache2_data         <= pack_ch1;
             r_cache2_valid        <= 1'b1;
             r_cache2_ch           <= 1'b1;   // cache holds ch1 data
-            msg_conflict_detected <= (eop_0 & eop_1) ? 1'b1 : 1'b0;   // telemetry pulse
         end
 
     end
 end
 
 // =================================================================
-// Timer Process — Internal Declarations
+// Batching-Priority Process — Internal Declarations
 // =================================================================
+//
+// This block computes ONLY the internal batching priority used by the
+// master-side arbiter.  All packet-level telemetry (length, gap, type,
+// address, tag, counts) is gathered externally by the axi4_telemetry
+// passthrough module, so the idle-gap / max-burst-depth / conflict logic
+// that used to live here has been removed.
+//
+// FIFO 2 (non-MWr) is served by the arbiter whenever it is non-empty, so it
+// needs no timeout/depth priority — only FIFO 0 and FIFO 1 do.
 
 // Zero-extended data_count for DEPTH_FEDILITY-wide comparisons
 wire [DEPTH_FEDILITY-1:0] data_count_0_ext = {{(DEPTH_FEDILITY-6){1'b0}}, data_count_0};
 wire [DEPTH_FEDILITY-1:0] data_count_1_ext = {{(DEPTH_FEDILITY-6){1'b0}}, data_count_1};
-wire [DEPTH_FEDILITY-1:0] data_count_2_ext = {{(DEPTH_FEDILITY-6){1'b0}}, data_count_2};
 
 // Timeout counters — increment while FIFO is non-empty, saturate at
 // time_threshold, reset to 0 when the FIFO empties (burst ended)
 reg [TIME_FEDILITY-1:0]   r_to_cnt_0;
 reg [TIME_FEDILITY-1:0]   r_to_cnt_1;
-reg [TIME_FEDILITY-1:0]   r_to_cnt_2;
 
-// Previous-cycle timeout level, for rising-edge detection
-reg                        r_to_prev_0;
-reg                        r_to_prev_1;
-reg                        r_to_prev_2;
+// 2-bit batching priority per MWr FIFO (internal, consumed by the arbiter):
+//   [0] = timeout reached, [1] = depth reached
+reg [1:0]                 priority_0;
+reg [1:0]                 priority_1;
 
-// Idle-gap counters: cycles elapsed between packet EOP and the next SOP
-// Width = TIME_FEDILITY*2 (matches Idle_Time output)
-reg [TIME_FEDILITY*2-1:0] r_idle_cnt_0;   // ch0 MWr path  → FIFO 0
-reg [TIME_FEDILITY*2-1:0] r_idle_cnt_1;   // ch1 MWr path  → FIFO 1
-reg [TIME_FEDILITY*2-1:0] r_idle_cnt_2;   // non-MWr path  → FIFO 2
-
-// 1 = an EOP has been seen and we are counting an inter-packet gap
-reg                        r_idle_active_0;
-reg                        r_idle_active_1;
-reg                        r_idle_active_2;
-
-// =================================================================
-// Packet-Boundary Detection Wires
-// SOP = first beat of a packet (tuser sop field asserted on accepted beat)
-// EOP = last  beat of a packet (tlast asserted on accepted beat)
-// =================================================================
-wire pkt_sop_0 = ch0_fire_mwr    && sop_0[0];
-wire pkt_eop_0 = ch0_fire_mwr    && s_axis_tlast_0;
-wire pkt_sop_1 = ch1_fire_mwr    && sop_1[0];
-wire pkt_eop_1 = ch1_fire_mwr    && s_axis_tlast_1;
-// FIFO 2 receives non-MWr traffic from either channel
-wire pkt_sop_2 = (ch0_fire_nonmwr && sop_0[0])         || (ch1_fire_nonmwr && sop_1[0]);
-wire pkt_eop_2 = (ch0_fire_nonmwr && s_axis_tlast_0)   || (ch1_fire_nonmwr && s_axis_tlast_1);
-
-// Combinatorial timeout condition per FIFO
+// Combinatorial timeout condition per MWr FIFO
 wire to_active_0 = !empty_0 && (r_to_cnt_0 >= time_threshold);
 wire to_active_1 = !empty_1 && (r_to_cnt_1 >= time_threshold);
-wire to_active_2 = !empty_2 && (r_to_cnt_2 >= time_threshold);
 
 // =================================================================
-// Timer Process
+// Batching-Priority Process
 //
-//  Timeout counter (per FIFO):
+//  Timeout counter (per MWr FIFO):
 //    • Increments every cycle while the FIFO is non-empty.
 //    • Saturates at time_threshold (no wrap-around).
 //    • Resets when the FIFO empties (burst ended).
 //    • priority[0] is asserted while counter >= time_threshold.
-//
-//  Idle-gap tracking (per FIFO path):
-//    • Starts counting on the EOP beat (or the cycle after, for
-//      multi-beat packets).
-//    • On each SOP the accumulated count is compared against the
-//      running maximum; Idle_Time is updated if a new max is found.
-//    • For single-beat packets (SOP+EOP same cycle) the previous
-//      gap is recorded and a new idle period begins immediately
-//      (last-write-wins of NBA semantics handles this correctly).
-//    • Idle_Time is the module-wide maximum across all three paths;
-//      simultaneous updates on multiple paths are resolved via a
-//      local variable so no gap can be missed.
-//
-//  max_burst_depth:
-//    • Updated on the rising edge of each FIFO's timeout signal.
-//    • Stores the largest data_count seen at any timeout event.
-//    • Simultaneous timeouts across FIFOs are handled with a local
-//      variable to ensure the true maximum is captured.
 //
 //  priority[1] (depth reached): registered replica of the
 //  combinatorial depth comparison, updated every cycle.
 // =================================================================
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        r_to_cnt_0      <= {TIME_FEDILITY{1'b0}};
-        r_to_cnt_1      <= {TIME_FEDILITY{1'b0}};
-        r_to_cnt_2      <= {TIME_FEDILITY{1'b0}};
-        r_to_prev_0     <= 1'b0;
-        r_to_prev_1     <= 1'b0;
-        r_to_prev_2     <= 1'b0;
-        r_idle_cnt_0    <= {(TIME_FEDILITY*2){1'b0}};
-        r_idle_cnt_1    <= {(TIME_FEDILITY*2){1'b0}};
-        r_idle_cnt_2    <= {(TIME_FEDILITY*2){1'b0}};
-        r_idle_active_0 <= 1'b0;
-        r_idle_active_1 <= 1'b0;
-        r_idle_active_2 <= 1'b0;
-        priority_0      <= 2'b00;
-        priority_1      <= 2'b00;
-        priority_2      <= 2'b00;
-        Idle_Time       <= {(TIME_FEDILITY*2){1'b0}};
-        max_burst_depth <= {DEPTH_FEDILITY{1'b0}};
+        r_to_cnt_0 <= {TIME_FEDILITY{1'b0}};
+        r_to_cnt_1 <= {TIME_FEDILITY{1'b0}};
+        priority_0 <= 2'b00;
+        priority_1 <= 2'b00;
     end else begin
 
         // ----------------------------------------------------------
@@ -622,9 +600,6 @@ always @(posedge clk or negedge rst_n) begin
         if      (empty_1)                     r_to_cnt_1 <= {TIME_FEDILITY{1'b0}};
         else if (r_to_cnt_1 < time_threshold) r_to_cnt_1 <= r_to_cnt_1 + 1'b1;
 
-        if      (empty_2)                     r_to_cnt_2 <= {TIME_FEDILITY{1'b0}};
-        else if (r_to_cnt_2 < time_threshold) r_to_cnt_2 <= r_to_cnt_2 + 1'b1;
-
         // ----------------------------------------------------------
         // Priority signals (registered, updated every cycle)
         //   [0] = timeout  : FIFO non-empty, counter has hit threshold
@@ -632,78 +607,6 @@ always @(posedge clk or negedge rst_n) begin
         // ----------------------------------------------------------
         priority_0 <= {(data_count_0_ext >= depth_threshold), to_active_0};
         priority_1 <= {(data_count_1_ext >= depth_threshold), to_active_1};
-        priority_2 <= {(data_count_2_ext >= depth_threshold), to_active_2};
-
-        // ----------------------------------------------------------
-        // max_burst_depth — capture data_count on each timeout
-        // rising edge (first trigger per burst).  A named block with
-        // a local variable handles simultaneous triggers correctly.
-        // ----------------------------------------------------------
-        r_to_prev_0 <= to_active_0;
-        r_to_prev_1 <= to_active_1;
-        r_to_prev_2 <= to_active_2;
-
-        begin : depth_max_blk
-            reg [DEPTH_FEDILITY-1:0] v;
-            v = max_burst_depth;
-            if (to_active_0 && !r_to_prev_0 && data_count_0_ext > v) v = data_count_0_ext;
-            if (to_active_1 && !r_to_prev_1 && data_count_1_ext > v) v = data_count_1_ext;
-            if (to_active_2 && !r_to_prev_2 && data_count_2_ext > v) v = data_count_2_ext;
-            max_burst_depth <= v;
-        end
-
-        // ----------------------------------------------------------
-        // Idle-gap tracking — FIFO 0 path (ch0 MWr)
-        // ----------------------------------------------------------
-        // Increment while gap is open
-        if (r_idle_active_0) r_idle_cnt_0 <= r_idle_cnt_0 + 1'b1;
-
-        // SOP: packet starts — gap recording is handled in idle_max_blk below
-        if (pkt_sop_0) r_idle_active_0 <= 1'b0;
-
-        // EOP: packet ends — open a new idle-gap window
-        // NBA order: EOP block writes last, so for single-beat packets
-        // (SOP+EOP same cycle) active=1 and cnt=0 are the final values.
-        if (pkt_eop_0) begin
-            r_idle_active_0 <= 1'b1;
-            r_idle_cnt_0    <= {(TIME_FEDILITY*2){1'b0}};
-        end
-
-        // ----------------------------------------------------------
-        // Idle-gap tracking — FIFO 1 path (ch1 MWr)
-        // ----------------------------------------------------------
-        if (r_idle_active_1) r_idle_cnt_1 <= r_idle_cnt_1 + 1'b1;
-        if (pkt_sop_1) r_idle_active_1 <= 1'b0;
-        if (pkt_eop_1) begin
-            r_idle_active_1 <= 1'b1;
-            r_idle_cnt_1    <= {(TIME_FEDILITY*2){1'b0}};
-        end
-
-        // ----------------------------------------------------------
-        // Idle-gap tracking — FIFO 2 path (non-MWr, both channels)
-        // ----------------------------------------------------------
-        if (r_idle_active_2) r_idle_cnt_2 <= r_idle_cnt_2 + 1'b1;
-        if (pkt_sop_2) r_idle_active_2 <= 1'b0;
-        if (pkt_eop_2) begin
-            r_idle_active_2 <= 1'b1;
-            r_idle_cnt_2    <= {(TIME_FEDILITY*2){1'b0}};
-        end
-
-        // ----------------------------------------------------------
-        // Idle_Time — running maximum across all three paths.
-        // A named block with a local variable ensures simultaneous
-        // SOP events on different paths both contribute to the max.
-        // r_idle_cnt_x is read at its pre-increment value (NBA
-        // semantics), giving cycles-between-EOP-and-SOP-exclusive.
-        // ----------------------------------------------------------
-        begin : idle_max_blk
-            reg [TIME_FEDILITY*2-1:0] v;
-            v = Idle_Time;
-            if (pkt_sop_0 && r_idle_active_0 && r_idle_cnt_0 > v) v = r_idle_cnt_0;
-            if (pkt_sop_1 && r_idle_active_1 && r_idle_cnt_1 > v) v = r_idle_cnt_1;
-            if (pkt_sop_2 && r_idle_active_2 && r_idle_cnt_2 > v) v = r_idle_cnt_2;
-            Idle_Time <= v;
-        end
 
     end
 end
@@ -756,7 +659,16 @@ always @(posedge clk or negedge rst_n) begin
         r_mst_state <= MST_IDLE;
         r_wait_0    <= 8'd0;
         r_wait_1    <= 8'd0;
+        r_in_pkt    <= 1'b0;
     end else begin
+
+        // ----------------------------------------------------------
+        // Track packet-in-flight on the master side.
+        //   Any accepted non-last beat opens a packet; the accepted
+        //   EOP beat closes it.  Held across underrun bubbles (no fire).
+        // ----------------------------------------------------------
+        if (cur_fire)
+            r_in_pkt <= ~cur_tlast;
 
         // ----------------------------------------------------------
         // Aging counters
@@ -788,9 +700,20 @@ always @(posedge clk or negedge rst_n) begin
             MST_SERVE_0,
             MST_SERVE_1,
             MST_SERVE_2: begin
-                // Hold until downstream accepts the EOP beat,
-                // then re-arbitrate for the next packet
-                if (cur_fire && cur_tlast)
+                // Re-arbitrate for the next packet when either:
+                //   (a) downstream accepts this packet's EOP beat, or
+                //   (b) the served FIFO has drained with no packet in
+                //       flight (r_in_pkt == 0).
+                //
+                // Case (b) is essential: the arbiter selects a FIFO on
+                // !empty, but on the cycle a FIFO's final (EOP) beat is
+                // popped it still reads non-empty (FWFT), so arb_src can
+                // re-select the same now-draining FIFO.  Without this
+                // escape the FSM would wedge in a SERVE state forever
+                // waiting for an EOP beat that can never arrive, dead-
+                // locking the whole switch.  r_in_pkt==0 guarantees we
+                // only leave at a true packet boundary, never mid-packet.
+                if ((cur_fire && cur_tlast) || (cur_empty && !r_in_pkt))
                     r_mst_state <= arb_src;
             end
 
