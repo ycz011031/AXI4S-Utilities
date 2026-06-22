@@ -3,7 +3,8 @@ module axi4_telemetry #(
     parameter integer AXIS_TUSER_WIDTH = 183,
     parameter integer TELEMETRY_DEPTH  = 512,  // Depth: number of packets to buffer
     parameter integer DATA_FIDELITY    = 8,    // Max value bits for length/gap counters (default 8 = max 255)
-    parameter integer ILA_DEPTH        = 0     // ILA sample depth (0 = auto-set to STREAM_DURATION)
+    parameter integer ILA_DEPTH        = 0,    // ILA sample depth (0 = auto-set to STREAM_DURATION)
+    parameter         ENABLE_ILA       = 1     // 1 = Enable ILA instantiation (requires ila_0 IP), 0 = Disable
 )(
     input wire                          clk,
     input wire                          rst_n,
@@ -46,10 +47,11 @@ localparam ADDR_WIDTH = $clog2(TELEMETRY_DEPTH);
 
 // Streaming state machine
 localparam [2:0] ST_COLLECT   = 3'd0;  // Collecting telemetry data (and gap before streaming)
-localparam [2:0] ST_STREAM_V1 = 3'd1;  // Streaming cycle 1 (valid high)
-localparam [2:0] ST_STREAM_V2 = 3'd2;  // Streaming cycle 2 (valid high)
-localparam [2:0] ST_STREAM_I1 = 3'd3;  // Streaming cycle 3 (valid low)
-localparam [2:0] ST_STREAM_I2 = 3'd4;  // Streaming cycle 4 (valid low)
+localparam [2:0] ST_READ_REQ  = 3'd1;  // Issue BRAM read request (1-cycle latency)
+localparam [2:0] ST_STREAM_V1 = 3'd2;  // Streaming cycle 1 (valid high, data arrives)
+localparam [2:0] ST_STREAM_V2 = 3'd3;  // Streaming cycle 2 (valid high)
+localparam [2:0] ST_STREAM_I1 = 3'd4;  // Streaming cycle 3 (valid low)
+localparam [2:0] ST_STREAM_I2 = 3'd5;  // Streaming cycle 4 (valid low, next read issued)
 
 // Timing constants (auto-calculated from TELEMETRY_DEPTH)
 localparam STREAM_DURATION = TELEMETRY_DEPTH * 4;  // 4 cycles per packet (2 valid + 2 invalid)
@@ -88,8 +90,8 @@ assign dword_count  = s_axis_tdata[73:64];  // DW count field for MWr/MRd
 
 // Transaction handshake (monitoring the passthrough)
 wire beat_fire = s_axis_tvalid && m_axis_tready;
-wire is_sop    = beat_fire && sop[0];
-wire is_eop    = beat_fire && s_axis_tlast;
+wire is_sop    = beat_fire && (|sop);   // catch SOP on either segment (tuser[81:80])
+wire is_eop    = beat_fire && ((|eop) | (s_axis_tlast));   // use tuser EOP field [87:86], not tlast
 
 // Type checks
 wire is_mwr = (request_type == MWR_TYPE);
@@ -112,16 +114,27 @@ reg [7:0]                r_cur_pkt_tag;
 reg [1:0]                r_cur_addr_type;
 reg [9:0]                r_cur_dword_count;
 
-// Telemetry buffer storage (ring buffer)
-localparam TEL_ENTRY_WIDTH = DATA_FIDELITY * 4 + 4 + 32 + 8 + 2;  // length + gap + payload_dw + type_count + type + addr + tag + addr_type
+// Telemetry buffer storage - SINGLE PACKED BRAM
+// Packing format (LSB to MSB):
+//   [7:0]     pkt_length
+//   [15:8]    pkt_gap
+//   [19:16]   pkt_type
+//   [51:20]   pkt_addr
+//   [59:52]   payload_dw
+//   [67:60]   pkt_tag
+//   [69:68]   addr_type
+localparam TEL_ENTRY_WIDTH = 70;  // Total packed width
 
-reg [DATA_FIDELITY-1:0]  mem_pkt_length   [0:TELEMETRY_DEPTH-1];
-reg [DATA_FIDELITY-1:0]  mem_pkt_gap      [0:TELEMETRY_DEPTH-1];
-reg [3:0]                mem_pkt_type     [0:TELEMETRY_DEPTH-1];
-reg [31:0]               mem_pkt_addr     [0:TELEMETRY_DEPTH-1];
-reg [DATA_FIDELITY-1:0]  mem_payload_dw   [0:TELEMETRY_DEPTH-1];
-reg [7:0]                mem_pkt_tag      [0:TELEMETRY_DEPTH-1];
-reg [1:0]                mem_addr_type    [0:TELEMETRY_DEPTH-1];
+// Use XPM Block RAM for better synthesis and routing
+wire                        mem_ena;
+wire                        mem_wea;
+wire [ADDR_WIDTH-1:0]       mem_addra;
+wire [TEL_ENTRY_WIDTH-1:0]  mem_dina;
+wire [TEL_ENTRY_WIDTH-1:0]  mem_douta;
+
+wire                        mem_enb;
+wire [ADDR_WIDTH-1:0]       mem_addrb;
+wire [TEL_ENTRY_WIDTH-1:0]  mem_doutb;
 
 // Buffer management
 reg [ADDR_WIDTH-1:0]     r_write_ptr;        // Next write location
@@ -155,6 +168,83 @@ reg [DATA_FIDELITY-1:0]  tel_mrd_count;      // MRd packets in this buffer
 reg [DATA_FIDELITY-1:0]  tel_other_count;    // Other packet types in this buffer
 
 // =================================================================
+// Block RAM Instantiation (XPM)
+// Single dual-port BRAM for better routing and timing
+// =================================================================
+
+xpm_memory_sdpram #(
+    .ADDR_WIDTH_A(ADDR_WIDTH),
+    .ADDR_WIDTH_B(ADDR_WIDTH),
+    .AUTO_SLEEP_TIME(0),
+    .BYTE_WRITE_WIDTH_A(TEL_ENTRY_WIDTH),
+    .CASCADE_HEIGHT(0),
+    .CLOCKING_MODE("common_clock"),
+    .ECC_MODE("no_ecc"),
+    .MEMORY_INIT_FILE("none"),
+    .MEMORY_INIT_PARAM("0"),
+    .MEMORY_OPTIMIZATION("true"),
+    .MEMORY_PRIMITIVE("block"),          // Force Block RAM (not distributed)
+    .MEMORY_SIZE(TELEMETRY_DEPTH * TEL_ENTRY_WIDTH),
+    .MESSAGE_CONTROL(0),
+    .READ_DATA_WIDTH_B(TEL_ENTRY_WIDTH),
+    .READ_LATENCY_B(1),                  // 1-cycle read latency
+    .READ_RESET_VALUE_B("0"),
+    .RST_MODE_A("SYNC"),
+    .RST_MODE_B("SYNC"),
+    .SIM_ASSERT_CHK(0),
+    .USE_EMBEDDED_CONSTRAINT(0),
+    .USE_MEM_INIT(0),
+    .USE_MEM_INIT_MMI(0),
+    .WAKEUP_TIME("disable_sleep"),
+    .WRITE_DATA_WIDTH_A(TEL_ENTRY_WIDTH),
+    .WRITE_MODE_B("read_first"),
+    .WRITE_PROTECT(1)
+) u_telemetry_bram (
+    .clka(clk),
+    .clkb(clk),
+    .ena(mem_ena),
+    .enb(mem_enb),
+    .wea(mem_wea),
+    .addra(mem_addra),
+    .dina(mem_dina),
+    .addrb(mem_addrb),
+    .doutb(mem_doutb),
+    .regceb(1'b1),
+    .rstb(~rst_n),
+    .sleep(1'b0),
+    .injectdbiterra(1'b0),
+    .injectsbiterra(1'b0),
+    .dbiterrb(),
+    .sbiterrb()
+);
+
+// BRAM write port control
+reg                     r_mem_wea;
+reg [ADDR_WIDTH-1:0]    r_mem_addra;
+reg [TEL_ENTRY_WIDTH-1:0] r_mem_dina;
+
+assign mem_ena   = 1'b1;  // Always enabled
+assign mem_wea   = r_mem_wea;
+assign mem_addra = r_mem_addra;
+assign mem_dina  = r_mem_dina;
+
+// BRAM read port control
+reg                     r_mem_enb;
+reg [ADDR_WIDTH-1:0]    r_mem_addrb;
+
+assign mem_enb   = r_mem_enb;
+assign mem_addrb = r_mem_addrb;
+
+// Unpack read data (registered output from BRAM, already has 1 cycle latency)
+wire [DATA_FIDELITY-1:0] mem_rd_pkt_length  = mem_doutb[7:0];
+wire [DATA_FIDELITY-1:0] mem_rd_pkt_gap     = mem_doutb[15:8];
+wire [3:0]               mem_rd_pkt_type    = mem_doutb[19:16];
+wire [31:0]              mem_rd_pkt_addr    = mem_doutb[51:20];
+wire [DATA_FIDELITY-1:0] mem_rd_payload_dw  = mem_doutb[59:52];
+wire [7:0]               mem_rd_pkt_tag     = mem_doutb[67:60];
+wire [1:0]               mem_rd_addr_type   = mem_doutb[69:68];
+
+// =================================================================
 // Packet Collection Process
 //
 // Monitors AXI-Stream transactions and records:
@@ -179,7 +269,13 @@ always @(posedge clk or negedge rst_n) begin
         r_buf_mwr_count   <= {DATA_FIDELITY{1'b0}};
         r_buf_mrd_count   <= {DATA_FIDELITY{1'b0}};
         r_buf_other_count <= {DATA_FIDELITY{1'b0}};
+        r_mem_wea         <= 1'b0;
+        r_mem_addra       <= {ADDR_WIDTH{1'b0}};
+        r_mem_dina        <= {TEL_ENTRY_WIDTH{1'b0}};
     end else begin
+
+        // Default: no write
+        r_mem_wea <= 1'b0;
 
         // ----------------------------------------------------------
         // SOP: Start of Packet
@@ -195,16 +291,13 @@ always @(posedge clk or negedge rst_n) begin
             r_cur_addr_type   <= address_type;
             r_cur_dword_count <= dword_count;
             
-            // Capture address MSB for MWr/MRd only
-            if (is_mwr || is_mrd)
-                r_cur_pkt_addr <= address_msb;
-            else
-                r_cur_pkt_addr <= 32'd0;
+            // Capture address MSB for all packet types
+            r_cur_pkt_addr <= address_msb;
                 
         // ----------------------------------------------------------
-        // Mid-packet beat
+        // Mid-packet beat (not EOP; EOP beat counted at write time)
         // ----------------------------------------------------------
-        end else if (r_in_packet && beat_fire && !s_axis_tlast) begin
+        end else if (r_in_packet && beat_fire && !(|eop)) begin
             // Increment beat counter (saturate at max)
             if (r_beat_count < {DATA_FIDELITY{1'b1}})
                 r_beat_count <= r_beat_count + 1'b1;
@@ -214,23 +307,26 @@ always @(posedge clk or negedge rst_n) begin
         // EOP: End of Packet (can coincide with SOP for single-beat pkts)
         // ----------------------------------------------------------
         if (is_eop) begin
-            // Store packet telemetry in buffer
-            mem_pkt_length[r_write_ptr] <= r_beat_count;
-            mem_pkt_gap[r_write_ptr]    <= r_gap_count;
-            mem_pkt_type[r_write_ptr]   <= r_cur_pkt_type;
-            mem_pkt_addr[r_write_ptr]   <= r_cur_pkt_addr;
-            mem_pkt_tag[r_write_ptr]    <= r_cur_pkt_tag;
-            mem_addr_type[r_write_ptr]  <= r_cur_addr_type;
-            
-            // Calculate payload in DWORDs (for MWr, use dword_count; others = 0)
-            if (r_cur_pkt_type == MWR_TYPE) begin
-                if (r_cur_dword_count[9:0] > {{(10-DATA_FIDELITY){1'b0}}, {DATA_FIDELITY{1'b1}}})
-                    mem_payload_dw[r_write_ptr] <= {DATA_FIDELITY{1'b1}};  // Saturate
-                else
-                    mem_payload_dw[r_write_ptr] <= r_cur_dword_count[DATA_FIDELITY-1:0];
-            end else begin
-                mem_payload_dw[r_write_ptr] <= {DATA_FIDELITY{1'b0}};
-            end
+            // Pack all fields into single BRAM write
+            // Calculate payload in DWORDs inline (for MWr, use dword_count; others = 0)
+            // Beat count: include the EOP beat itself (+1), except for single-beat
+            // packets where is_sop fires on the same cycle (store 1 directly).
+            r_mem_dina <= {
+                r_cur_addr_type,      // [69:68]
+                r_cur_pkt_tag,        // [67:60]
+                (r_cur_pkt_type == MWR_TYPE) ?  // [59:52] payload_dw
+                    ((r_cur_dword_count[9:0] > {{(10-DATA_FIDELITY){1'b0}}, {DATA_FIDELITY{1'b1}}}) ?
+                        {DATA_FIDELITY{1'b1}} : r_cur_dword_count[DATA_FIDELITY-1:0]) :
+                    {DATA_FIDELITY{1'b0}},
+                r_cur_pkt_addr,       // [51:20]
+                r_cur_pkt_type,       // [19:16]
+                r_gap_count,          // [15:8]
+                is_sop ? {{(DATA_FIDELITY-1){1'b0}}, 1'b1}  // single-beat packet
+                       : (r_beat_count < {DATA_FIDELITY{1'b1}} ? r_beat_count + 1'b1
+                                                                 : {DATA_FIDELITY{1'b1}})  // [7:0]
+            };
+            r_mem_addra <= r_write_ptr;
+            r_mem_wea   <= 1'b1;  // Write enable
             
             // Advance write pointer (ring buffer)
             r_write_ptr <= r_write_ptr + 1'b1;
@@ -284,21 +380,23 @@ end
 // =================================================================
 // Streaming State Machine
 //
-// Streams out telemetry data in a cyclic pattern:
-//   - 1024 cycles streaming (512 packets × 2 cycles valid + 2 cycles invalid)
-//   - 8192 cycles gap
-//   - Repeat
+// Streams out telemetry data in a cyclic pattern with BRAM read pipelining:
+//   - COLLECT: gap between streaming windows
+//   - READ_REQ: issue BRAM read (1-cycle latency)
+//   - STREAM_V1/V2: 2 cycles valid (data from BRAM)
+//   - STREAM_I1/I2: 2 cycles invalid (next read issued in I2)
 //
-// Data output pattern per packet:
-//   Cycle 0-1: valid high (data stable)
-//   Cycle 2-3: valid low  (data stable but marked invalid)
+// Timing: 512 packets × (1 read + 4 output) = 2560 cycles per stream
 // =================================================================
+
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
         r_stream_state   <= ST_COLLECT;
         r_stream_counter <= 16'd0;
         r_stream_pkt_cnt <= {ADDR_WIDTH{1'b0}};
         r_read_ptr       <= {ADDR_WIDTH{1'b0}};
+        r_mem_enb        <= 1'b0;
+        r_mem_addrb      <= {ADDR_WIDTH{1'b0}};
         tel_enable       <= 1'b0;
         tel_valid        <= 1'b0;
         tel_pkt_length   <= {DATA_FIDELITY{1'b0}};
@@ -322,12 +420,13 @@ always @(posedge clk or negedge rst_n) begin
             ST_COLLECT: begin
                 tel_enable <= 1'b0;
                 tel_valid  <= 1'b0;
+                r_mem_enb  <= 1'b0;
                 
                 if (r_stream_counter < (STREAM_GAP - 1)) begin
                     r_stream_counter <= r_stream_counter + 1'b1;
                 end else begin
-                    // Start streaming
-                    r_stream_state   <= ST_STREAM_V1;
+                    // Start streaming - issue first read
+                    r_stream_state   <= ST_READ_REQ;
                     r_stream_counter <= 16'd0;
                     r_stream_pkt_cnt <= {ADDR_WIDTH{1'b0}};
                     r_read_ptr       <= r_write_ptr - r_valid_count;  // Start from oldest entry
@@ -335,21 +434,40 @@ always @(posedge clk or negedge rst_n) begin
             end
 
             // --------------------------------------------------
-            // STREAM_V1: First valid cycle (load data)
+            // READ_REQ: Issue BRAM read request
+            // Data will be available next cycle
+            // --------------------------------------------------
+            ST_READ_REQ: begin
+                tel_enable <= 1'b1;
+                
+                if (r_stream_pkt_cnt < r_valid_count) begin
+                    // Issue read request
+                    r_mem_enb   <= 1'b1;
+                    r_mem_addrb <= r_read_ptr;
+                end else begin
+                    r_mem_enb <= 1'b0;
+                end
+                
+                r_stream_state   <= ST_STREAM_V1;
+                r_stream_counter <= r_stream_counter + 1'b1;
+            end
+
+            // --------------------------------------------------
+            // STREAM_V1: First valid cycle (data from BRAM available)
             // --------------------------------------------------
             ST_STREAM_V1: begin
                 tel_enable <= 1'b1;
                 tel_valid  <= 1'b1;
                 
-                // Load telemetry data from memory
+                // Load telemetry data from BRAM output
                 if (r_stream_pkt_cnt < r_valid_count) begin
-                    tel_pkt_length  <= mem_pkt_length[r_read_ptr];
-                    tel_pkt_gap     <= mem_pkt_gap[r_read_ptr];
-                    tel_pkt_type    <= mem_pkt_type[r_read_ptr];
-                    tel_pkt_addr    <= mem_pkt_addr[r_read_ptr];
-                    tel_payload_dw  <= mem_payload_dw[r_read_ptr];
-                    tel_pkt_tag     <= mem_pkt_tag[r_read_ptr];
-                    tel_addr_type   <= mem_addr_type[r_read_ptr];
+                    tel_pkt_length  <= mem_rd_pkt_length;
+                    tel_pkt_gap     <= mem_rd_pkt_gap;
+                    tel_pkt_type    <= mem_rd_pkt_type;
+                    tel_pkt_addr    <= mem_rd_pkt_addr;
+                    tel_payload_dw  <= mem_rd_payload_dw;
+                    tel_pkt_tag     <= mem_rd_pkt_tag;
+                    tel_addr_type   <= mem_rd_addr_type;
                 end else begin
                     // No more valid data, output zeros
                     tel_pkt_length  <= {DATA_FIDELITY{1'b0}};
@@ -395,6 +513,7 @@ always @(posedge clk or negedge rst_n) begin
 
             // --------------------------------------------------
             // STREAM_I2: Second invalid cycle, advance to next packet
+            // Issue next BRAM read request here
             // --------------------------------------------------
             ST_STREAM_I2: begin
                 tel_enable <= 1'b1;
@@ -408,8 +527,10 @@ always @(posedge clk or negedge rst_n) begin
                 if (r_stream_counter >= (STREAM_DURATION - 1)) begin
                     r_stream_state   <= ST_COLLECT;
                     r_stream_counter <= 16'd0;
+                    r_mem_enb        <= 1'b0;
                 end else begin
-                    r_stream_state <= ST_STREAM_V1;
+                    // Continue streaming - go to READ_REQ for next packet
+                    r_stream_state <= ST_READ_REQ;
                 end
             end
 
@@ -426,48 +547,100 @@ end
 // Each signal has a dedicated probe for easy viewing and independent triggering
 // =================================================================
 
-// ILA IP Core Instantiation
+// ILA IP Core Instantiation (conditional)
 // Configuration:
 //   - 20 individual probes (one per signal)
 //   - Sample depth: ACTUAL_ILA_DEPTH (defaults to STREAM_DURATION)
 //   - Each probe has its own comparator for flexible triggering
 //
+// To enable ILA:
+//   1. Generate the ila_0 IP using the TCL script below
+//   2. Set ENABLE_ILA parameter to 1 when instantiating this module
+//
 // Create with Vivado TCL:
 //   See comments below for automated IP generation script
 
-ila_0 u_ila_telemetry (
-    .clk     (clk),
-    
-    // Control & Status Signals
-    .probe0  (rst_n),              // [0:0]   System reset
-    .probe1  (tel_enable),         // [0:0]   Streaming window active
-    .probe2  (tel_valid),          // [0:0]   Data valid flag
-    .probe3  (r_gap_active),       // [0:0]   Counting gap between packets
-    .probe4  (r_in_packet),        // [0:0]   Currently in packet
-    
-    // State Machine & Counters
-    .probe5  (r_stream_state),     // [2:0]   Stream state machine
-    .probe6  (r_stream_counter),   // [15:0]  Stream/gap cycle counter
-    
-    // Packet Telemetry Data
-    .probe7  (tel_pkt_length),     // [7:0]   Packet length in beats
-    .probe8  (tel_pkt_gap),        // [7:0]   Gap between packets (cycles)
-    .probe9  (tel_pkt_type),       // [3:0]   PCIe request type
-    .probe10 (tel_pkt_addr),       // [31:0]  Packet address (MSB 32 bits)
-    .probe11 (tel_payload_dw),     // [7:0]   Payload size in DWORDs
-    .probe12 (tel_pkt_tag),        // [7:0]   PCIe transaction tag
-    .probe13 (tel_addr_type),      // [1:0]   Address type
-    
-    // Statistics
-    .probe14 (tel_total_pkts),     // [7:0]   Total packets seen (saturating)
-    .probe15 (tel_mwr_count),      // [7:0]   MWr packet count in buffer
-    .probe16 (tel_mrd_count),      // [7:0]   MRd packet count in buffer
-    .probe17 (tel_other_count),    // [7:0]   Other packet types in buffer
-    
-    // Internal Buffer State
-    .probe18 (r_valid_count),      // [8:0]   Valid entries in buffer (max 512)
-    .probe19 (r_write_ptr)         // [8:0]   Current write pointer
-);
+generate
+    if (ENABLE_ILA == 1) begin : gen_ila
+        ila_0 u_ila_telemetry (
+            .clk     (clk),
+            
+            // Control & Status Signals
+            .probe0  (rst_n),              // [0:0]   System reset
+            .probe1  (tel_enable),         // [0:0]   Streaming window active
+            .probe2  (tel_valid),          // [0:0]   Data valid flag
+            .probe3  (r_gap_active),       // [0:0]   Counting gap between packets
+            .probe4  (r_in_packet),        // [0:0]   Currently in packet
+            
+            // State Machine & Counters
+            .probe5  (r_stream_state),     // [2:0]   Stream state machine
+            .probe6  (r_stream_counter),   // [15:0]  Stream/gap cycle counter
+            
+            // Packet Telemetry Data
+            .probe7  (tel_pkt_length),     // [7:0]   Packet length in beats
+            .probe8  (tel_pkt_gap),        // [7:0]   Gap between packets (cycles)
+            .probe9  (tel_pkt_type),       // [3:0]   PCIe request type
+            .probe10 (tel_pkt_addr),       // [31:0]  Packet address (MSB 32 bits)
+            .probe11 (tel_payload_dw),     // [7:0]   Payload size in DWORDs
+            .probe12 (tel_pkt_tag),        // [7:0]   PCIe transaction tag
+            .probe13 (tel_addr_type),      // [1:0]   Address type
+            
+            // Statistics
+            .probe14 (tel_total_pkts),     // [7:0]   Total packets seen (saturating)
+            .probe15 (tel_mwr_count),      // [7:0]   MWr packet count in buffer
+            .probe16 (tel_mrd_count),      // [7:0]   MRd packet count in buffer
+            .probe17 (tel_other_count),    // [7:0]   Other packet types in buffer
+            
+            // Internal Buffer State
+            .probe18 (r_valid_count),      // [8:0]   Valid entries in buffer (max 512)
+            .probe19 (r_write_ptr)         // [8:0]   Current write pointer
+        );
+    end
+endgenerate
 
+// =================================================================
+// ILA IP Generation Script (Vivado TCL)
+// =================================================================
+// Step 1: Copy and run in Vivado TCL console to generate the ILA IP:
+//
+// create_ip -name ila -vendor xilinx.com -library ip -module_name ila_0
+// set_property -dict [list \
+//   CONFIG.C_NUM_OF_PROBES {20} \
+//   CONFIG.C_PROBE0_WIDTH {1} \
+//   CONFIG.C_PROBE1_WIDTH {1} \
+//   CONFIG.C_PROBE2_WIDTH {1} \
+//   CONFIG.C_PROBE3_WIDTH {1} \
+//   CONFIG.C_PROBE4_WIDTH {1} \
+//   CONFIG.C_PROBE5_WIDTH {3} \
+//   CONFIG.C_PROBE6_WIDTH {16} \
+//   CONFIG.C_PROBE7_WIDTH {8} \
+//   CONFIG.C_PROBE8_WIDTH {8} \
+//   CONFIG.C_PROBE9_WIDTH {4} \
+//   CONFIG.C_PROBE10_WIDTH {32} \
+//   CONFIG.C_PROBE11_WIDTH {8} \
+//   CONFIG.C_PROBE12_WIDTH {8} \
+//   CONFIG.C_PROBE13_WIDTH {2} \
+//   CONFIG.C_PROBE14_WIDTH {8} \
+//   CONFIG.C_PROBE15_WIDTH {8} \
+//   CONFIG.C_PROBE16_WIDTH {8} \
+//   CONFIG.C_PROBE17_WIDTH {8} \
+//   CONFIG.C_PROBE18_WIDTH {9} \
+//   CONFIG.C_PROBE19_WIDTH {9} \
+//   CONFIG.C_DATA_DEPTH {2048} \
+//   CONFIG.C_TRIGIN_EN {false} \
+//   CONFIG.C_TRIGOUT_EN {false} \
+//   CONFIG.C_ADV_TRIGGER {true} \
+//   CONFIG.C_EN_STRG_QUAL {1} \
+//   CONFIG.ALL_PROBE_SAME_MU {true} \
+// ] [get_ips ila_0]
+//
+// Step 2: Set ENABLE_ILA=1 when instantiating this module:
+//   axi4_telemetry #(.ENABLE_ILA(1)) u_telemetry (...);
+//
+// Note: C_DATA_DEPTH should match STREAM_DURATION:
+//   256 packets  -> 1024 depth
+//   512 packets  -> 2048 depth (default)
+//   1024 packets -> 4096 depth
+// =================================================================
 
 endmodule
