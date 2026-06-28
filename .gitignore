@@ -4,3 +4,4 @@ project_1.sim/
 AXI_switch_project/
 imports/
 sim_run/
+*.md

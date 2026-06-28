@@ -4,7 +4,8 @@ module axi4_mwr_batch #(
     parameter integer AXIS_FIFO_WIDTH  = AXIS_DATA_WIDTH + AXIS_TUSER_WIDTH + 2, // Data + TUSER + SOP/EOP
     parameter integer FIFO_DEPTH       = 128,
     parameter integer TIME_FEDILITY = 8,
-    parameter integer DEPTH_FEDILITY = 8
+    parameter integer DEPTH_FEDILITY = 8,
+    parameter         IF_TYPE = "CQ"  // "CQ" or "RQ" — selects tuser sideband bit layout (PG343)
 )(
     input wire                          clk,
     input wire                          rst_n,
@@ -242,6 +243,20 @@ xpm_fifo_sync #(
     .injectsbiterr (1'b0)
 );
 
+// -----------------------------------------------------------------------------
+// tuser sideband field offsets (LSB of each field).
+//
+// The descriptor (tdata) fields — request_type[78:75], address_type[1:0],
+// address[63:2], tag[103:96] — share identical positions in both the CQ and RQ
+// descriptor formats, so only the tuser SOP/EOP/EOP_PTR offsets move between
+// interfaces (PG343 §1.2 vs §3.2):
+//   CQ : is_sop[81:80] is_eop[87:86] is_eop0_ptr[91:88]
+//   RQ : is_sop[21:20] is_eop[27:26] is_eop0_ptr[31:28]
+// -----------------------------------------------------------------------------
+localparam integer SOP_LO    = (IF_TYPE == "RQ") ? 20 : 80;
+localparam integer EOP_LO    = (IF_TYPE == "RQ") ? 26 : 86;
+localparam integer EOPPTR_LO = (IF_TYPE == "RQ") ? 28 : 88;
+
 //Decoding Key Values from slave interfaces
 wire [3:0]    request_type_0;
 wire [1:0]    address_type_0;
@@ -263,17 +278,17 @@ assign request_type_0 = s_axis_tdata_0[78:75];
 assign address_type_0 = s_axis_tdata_0[1:0];
 assign address_0      = s_axis_tdata_0[63:2];
 assign tag_0          = s_axis_tdata_0[103:96];
-assign sop_0          = s_axis_tuser_0[81:80];
-assign eop_0          = s_axis_tuser_0[87:86];
-assign eop_ptr_0      = s_axis_tuser_0[91:88];
+assign sop_0          = s_axis_tuser_0[SOP_LO    + 1 : SOP_LO];
+assign eop_0          = s_axis_tuser_0[EOP_LO    + 1 : EOP_LO];
+assign eop_ptr_0      = s_axis_tuser_0[EOPPTR_LO + 3 : EOPPTR_LO];
 
 assign request_type_1 = s_axis_tdata_1[78:75];
 assign address_type_1 = s_axis_tdata_1[1:0];
 assign address_1      = s_axis_tdata_1[63:2];
 assign tag_1          = s_axis_tdata_1[103:96];
-assign sop_1          = s_axis_tuser_1[81:80];
-assign eop_1          = s_axis_tuser_1[87:86];
-assign eop_ptr_1      = s_axis_tuser_1[91:88];
+assign sop_1          = s_axis_tuser_1[SOP_LO    + 1 : SOP_LO];
+assign eop_1          = s_axis_tuser_1[EOP_LO    + 1 : EOP_LO];
+assign eop_ptr_1      = s_axis_tuser_1[EOPPTR_LO + 3 : EOPPTR_LO];
 
 // =================================================================
 // Local Constants
@@ -409,8 +424,8 @@ wire [AXIS_TUSER_WIDTH-1:0] cur_tuser  = cur_data[AXIS_DATA_WIDTH + AXIS_TUSER_W
 wire [AXIS_DATA_WIDTH-1:0]  cur_tdata  = cur_data[AXIS_DATA_WIDTH-1:0];
 
 // eop_ptr: byte index (0-based) of the last valid byte in this beat
-// stored in tuser[91:88] per the slave-side decode
-wire [3:0] cur_eop_ptr = cur_tuser[91:88];
+// stored in tuser[EOPPTR_LO+3:EOPPTR_LO] per the slave-side decode (CQ/RQ)
+wire [3:0] cur_eop_ptr = cur_tuser[EOPPTR_LO + 3 : EOPPTR_LO];
 
 // --- TKEEP Recovery ---
 // Non-EOP beat : every byte is valid → all 1s

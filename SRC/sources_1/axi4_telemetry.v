@@ -4,7 +4,8 @@ module axi4_telemetry #(
     parameter integer TELEMETRY_DEPTH  = 512,  // Depth: number of packets to buffer
     parameter integer DATA_FIDELITY    = 8,    // Max value bits for length/gap counters (default 8 = max 255)
     parameter integer ILA_DEPTH        = 0,    // ILA sample depth (0 = auto-set to STREAM_DURATION)
-    parameter         ENABLE_ILA       = 1     // 1 = Enable ILA instantiation (requires ila_0 IP), 0 = Disable
+    parameter         ENABLE_ILA       = 1,    // 1 = Enable ILA instantiation (requires ila_0 IP), 0 = Disable
+    parameter         IF_TYPE          = "CQ"  // "CQ" or "RQ" — selects tuser sideband bit layout (PG343)
 )(
     input wire                          clk,
     input wire                          rst_n,
@@ -45,6 +46,20 @@ localparam MRD_TYPE = 4'b0000;
 // Address width for telemetry buffer
 localparam ADDR_WIDTH = $clog2(TELEMETRY_DEPTH);
 
+// -----------------------------------------------------------------------------
+// tuser sideband field offsets (LSB of each field).
+//
+// The descriptor (tdata) fields — request_type[78:75], address_type[1:0],
+// address[63:2], dword_count[74:64], tag[103:96] — share identical positions in
+// both the CQ and RQ descriptor formats, so only the tuser SOP/EOP/EOP_PTR
+// offsets move between interfaces (PG343 §1.2 vs §3.2):
+//   CQ : is_sop[81:80] is_eop[87:86] is_eop0_ptr[91:88]
+//   RQ : is_sop[21:20] is_eop[27:26] is_eop0_ptr[31:28]
+// -----------------------------------------------------------------------------
+localparam integer SOP_LO    = (IF_TYPE == "RQ") ? 20 : 80;
+localparam integer EOP_LO    = (IF_TYPE == "RQ") ? 26 : 86;
+localparam integer EOPPTR_LO = (IF_TYPE == "RQ") ? 28 : 88;
+
 // Streaming state machine
 localparam [2:0] ST_COLLECT   = 3'd0;  // Collecting telemetry data (and gap before streaming)
 localparam [2:0] ST_READ_REQ  = 3'd1;  // Issue BRAM read request (1-cycle latency)
@@ -76,22 +91,22 @@ wire [7:0]    tag;
 wire [1:0]    sop;
 wire [1:0]    eop;
 wire [3:0]    eop_ptr;
-wire [9:0]    dword_count;
+wire [10:0]   dword_count;
 
 assign request_type = s_axis_tdata[78:75];
 assign address_type = s_axis_tdata[1:0];
 assign address_full = s_axis_tdata[63:2];
 assign address_msb  = address_full[61:30];  // Top 32 bits of the 62-bit address field
 assign tag          = s_axis_tdata[103:96];
-assign sop          = s_axis_tuser[81:80];
-assign eop          = s_axis_tuser[87:86];
-assign eop_ptr      = s_axis_tuser[91:88];
-assign dword_count  = s_axis_tdata[73:64];  // DW count field for MWr/MRd
+assign sop          = s_axis_tuser[SOP_LO    + 1 : SOP_LO];
+assign eop          = s_axis_tuser[EOP_LO    + 1 : EOP_LO];
+assign eop_ptr      = s_axis_tuser[EOPPTR_LO + 3 : EOPPTR_LO];
+assign dword_count  = s_axis_tdata[74:64];  // DW count field for MWr/MRd (11 bits, 0-1024 per PG343)
 
 // Transaction handshake (monitoring the passthrough)
 wire beat_fire = s_axis_tvalid && m_axis_tready;
-wire is_sop    = beat_fire && (|sop);   // catch SOP on either segment (tuser[81:80])
-wire is_eop    = beat_fire && ((|eop) | (s_axis_tlast));   // use tuser EOP field [87:86], not tlast
+wire is_sop    = beat_fire && (|sop);   // catch SOP on either segment (tuser is_sop field)
+wire is_eop    = beat_fire && ((|eop) | (s_axis_tlast));   // use tuser is_eop field, not tlast
 
 // Type checks
 wire is_mwr = (request_type == MWR_TYPE);
@@ -112,7 +127,7 @@ reg [3:0]                r_cur_pkt_type;
 reg [31:0]               r_cur_pkt_addr;
 reg [7:0]                r_cur_pkt_tag;
 reg [1:0]                r_cur_addr_type;
-reg [9:0]                r_cur_dword_count;
+reg [10:0]               r_cur_dword_count;
 
 // Telemetry buffer storage - SINGLE PACKED BRAM
 // Packing format (LSB to MSB):
@@ -262,7 +277,7 @@ always @(posedge clk or negedge rst_n) begin
         r_cur_pkt_addr    <= 32'd0;
         r_cur_pkt_tag     <= 8'd0;
         r_cur_addr_type   <= 2'd0;
-        r_cur_dword_count <= 10'd0;
+        r_cur_dword_count <= 11'd0;
         r_write_ptr       <= {ADDR_WIDTH{1'b0}};
         r_valid_count     <= {ADDR_WIDTH{1'b0}};
         r_total_pkts      <= {DATA_FIDELITY{1'b0}};
@@ -315,7 +330,7 @@ always @(posedge clk or negedge rst_n) begin
                 r_cur_addr_type,      // [69:68]
                 r_cur_pkt_tag,        // [67:60]
                 (r_cur_pkt_type == MWR_TYPE) ?  // [59:52] payload_dw
-                    ((r_cur_dword_count[9:0] > {{(10-DATA_FIDELITY){1'b0}}, {DATA_FIDELITY{1'b1}}}) ?
+                    ((r_cur_dword_count[10:0] > {{(11-DATA_FIDELITY){1'b0}}, {DATA_FIDELITY{1'b1}}}) ?
                         {DATA_FIDELITY{1'b1}} : r_cur_dword_count[DATA_FIDELITY-1:0]) :
                     {DATA_FIDELITY{1'b0}},
                 r_cur_pkt_addr,       // [51:20]
