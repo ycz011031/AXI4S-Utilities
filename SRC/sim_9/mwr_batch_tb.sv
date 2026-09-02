@@ -19,21 +19,21 @@ reg  [TIME_FEDILITY-1:0]      time_threshold;
 reg  [DEPTH_FEDILITY-1:0]     depth_threshold;
 
 reg  [AXIS_DATA_WIDTH-1:0]    s_axis_tdata_0;
-reg  [AXIS_DATA_WIDTH/8-1:0]  s_axis_tkeep_0;
+reg  [AXIS_DATA_WIDTH/32-1:0] s_axis_tkeep_0;   // PG343: tkeep is per-DWORD
 reg                           s_axis_tvalid_0;
 reg                           s_axis_tlast_0;
 reg  [AXIS_TUSER_WIDTH-1:0]   s_axis_tuser_0;
 wire                          s_axis_tready_0;
 
 reg  [AXIS_DATA_WIDTH-1:0]    s_axis_tdata_1;
-reg  [AXIS_DATA_WIDTH/8-1:0]  s_axis_tkeep_1;
+reg  [AXIS_DATA_WIDTH/32-1:0] s_axis_tkeep_1;   // PG343: tkeep is per-DWORD
 reg                           s_axis_tvalid_1;
 reg                           s_axis_tlast_1;
 reg  [AXIS_TUSER_WIDTH-1:0]   s_axis_tuser_1;
 wire                          s_axis_tready_1;
 
 wire [AXIS_DATA_WIDTH-1:0]    m_axis_tdata;
-wire [AXIS_DATA_WIDTH/8-1:0]  m_axis_tkeep;
+wire [AXIS_DATA_WIDTH/32-1:0] m_axis_tkeep;    // PG343: tkeep is per-DWORD
 wire                          m_axis_tvalid;
 wire                          m_axis_tlast;
 wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser;
@@ -125,6 +125,19 @@ int total_observed_beats;
 int total_completed;
 int total_unknown_packets;
 
+// -----------------------------------------------------------------------------
+// On-the-wire framing monitor (independent of the out-of-order scoreboard).
+//
+// The pkt_db scoreboard reassembles by pkt_id, so it accepts a stream whose
+// beats are interleaved between packets as long as each packet's beats are all
+// present and in per-packet order.  That is NOT a valid AXIS/PCIe packet: on
+// the wire a packet must run contiguously from SOP to EOP with no foreign
+// beats in between.  This monitor enforces exactly that.
+// -----------------------------------------------------------------------------
+bit              out_in_flight;   // 1 = an output packet is open (SOP seen, EOP not yet)
+longint unsigned out_cur_id;      // pkt_id of the open output packet
+int              framing_errors;
+
 function automatic bit [3:0] gen_nonmwr_type;
 	int r;
 begin
@@ -166,6 +179,32 @@ begin
 	req_type = m_axis_tdata[78:75];
 
 	total_observed_beats = total_observed_beats + 1;
+
+	// ----- On-the-wire framing check (contiguity) -----
+	// m_axis_tuser[80] = is_sop[0] (CQ layout, matches this TB's driver).
+	if (!out_in_flight) begin
+		// First beat of a new packet on the wire — must carry SOP.
+		if (m_axis_tuser[80] != 1'b1) begin
+			framing_errors = framing_errors + 1;
+			$error("FRAMING: packet opens without SOP (id=%0d)", pkt_id);
+		end
+		out_cur_id    = pkt_id;
+		out_in_flight = 1'b1;
+	end else begin
+		// Mid-packet — must NOT be a SOP and must be the same packet id.
+		if (m_axis_tuser[80] == 1'b1) begin
+			framing_errors = framing_errors + 1;
+			$error("FRAMING: SOP mid-packet (interleave) open=%0d new=%0d",
+				   out_cur_id, pkt_id);
+		end
+		if (pkt_id != out_cur_id) begin
+			framing_errors = framing_errors + 1;
+			$error("FRAMING: foreign beat id=%0d spliced into packet id=%0d",
+				   pkt_id, out_cur_id);
+		end
+	end
+	if (m_axis_tlast)
+		out_in_flight = 1'b0;   // packet closed
 
 	if (!pkt_db.exists(pkt_id)) begin
 		pkt_db[pkt_id].exp_type   = 4'h0;
@@ -214,14 +253,14 @@ task automatic drive_packet(
 	int b;
 	reg [AXIS_DATA_WIDTH-1:0] d;
 	reg [AXIS_TUSER_WIDTH-1:0] u;
-	reg [AXIS_DATA_WIDTH/8-1:0] k;
+	reg [AXIS_DATA_WIDTH/32-1:0] k;   // PG343: tkeep is per-DWORD
 	bit last;
 	bit [3:0] eop_ptr;
 begin
 	for (b = 0; b < beats; b = b + 1) begin
 		d = '0;
 		u = '0;
-		k = {AXIS_DATA_WIDTH/8{1'b1}};
+		k = {AXIS_DATA_WIDTH/32{1'b1}};
 		last = (b == beats - 1);
 
 		// Required protocol fields.
@@ -340,9 +379,23 @@ begin
 		if (pkt_db[id].exp_beats > 0) begin
 			if (pkt_db[id].seen_beats == 0) begin
 				missing = missing + 1;
+				// Never appeared at the output → whole packet stuck in a FIFO
+				// (or never admitted).  Type/port localizes the path.
+				$display("  MISSING  id=%0d type=%0h port=%0d exp_beats=%0d %s",
+					id, pkt_db[id].exp_type, pkt_db[id].exp_port,
+					pkt_db[id].exp_beats,
+					(pkt_db[id].exp_type == MWR_TYPE) ? "(MWr->FIFO0/1)"
+					                                  : "(nonMWr->FIFO2)");
 			end else if (!pkt_db[id].saw_eop || pkt_db[id].bad ||
 						 (pkt_db[id].seen_beats != pkt_db[id].exp_beats)) begin
 				incomplete = incomplete + 1;
+				// Partially emerged → stuck mid-packet (lost EOP / lost beat).
+				$display("  INCOMPL  id=%0d type=%0h port=%0d seen=%0d/%0d eop=%0b bad=%0b %s",
+					id, pkt_db[id].exp_type, pkt_db[id].exp_port,
+					pkt_db[id].seen_beats, pkt_db[id].exp_beats,
+					pkt_db[id].saw_eop, pkt_db[id].bad,
+					(pkt_db[id].exp_type == MWR_TYPE) ? "(MWr->FIFO0/1)"
+					                                  : "(nonMWr->FIFO2)");
 			end else begin
 				good = good + 1;
 			end
@@ -357,13 +410,15 @@ begin
 	$display("unknown output packet : %0d", total_unknown_packets);
 	$display("observed output beats : %0d", total_observed_beats);
 	$display("completed packets     : %0d", total_completed);
+	$display("framing errors        : %0d", framing_errors);
 	$display("======================================================\n");
 
-	if ((missing == 0) && (incomplete == 0) && (total_unknown_packets == 0))
+	if ((missing == 0) && (incomplete == 0) && (total_unknown_packets == 0) &&
+		(framing_errors == 0))
 		$display("TEST PASS");
 	else
-		$error("TEST FAIL: missing=%0d incomplete=%0d unknown=%0d",
-			   missing, incomplete, total_unknown_packets);
+		$error("TEST FAIL: missing=%0d incomplete=%0d unknown=%0d framing=%0d",
+			   missing, incomplete, total_unknown_packets, framing_errors);
 end
 endtask
 
@@ -377,6 +432,9 @@ initial begin
 	total_observed_beats = 0;
 	total_completed      = 0;
 	total_unknown_packets= 0;
+	out_in_flight        = 1'b0;
+	out_cur_id           = '0;
+	framing_errors       = 0;
 	traffic_done         = 1'b0;
 
 	reset_dut();
@@ -398,7 +456,8 @@ end
 
 // Watchdog
 initial begin
-	repeat (500000) @(posedge clk);
+	repeat (50000) @(posedge clk);
+	report_results();
 	$fatal(1, "Timeout in mwr_batch_tb");
 end
 

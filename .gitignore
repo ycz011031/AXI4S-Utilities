@@ -5,3 +5,5 @@ AXI_switch_project/
 imports/
 sim_run/
 *.md
+*.log
+*.pb

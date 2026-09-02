@@ -12,7 +12,7 @@ module axi4_telemetry #(
 
     // AXI4-Stream Slave Interface (input)
     input  wire [AXIS_DATA_WIDTH-1:0]    s_axis_tdata,
-    input  wire [AXIS_DATA_WIDTH/8-1:0]  s_axis_tkeep,
+    input  wire [AXIS_DATA_WIDTH/32-1:0] s_axis_tkeep,   // PG343: tkeep is per-DWORD
     input  wire                          s_axis_tvalid,
     input  wire                          s_axis_tlast,
     input  wire [AXIS_TUSER_WIDTH-1:0]   s_axis_tuser,
@@ -20,7 +20,7 @@ module axi4_telemetry #(
 
     // AXI4-Stream Master Interface (transparent passthrough)
     output wire [AXIS_DATA_WIDTH-1:0]    m_axis_tdata,
-    output wire [AXIS_DATA_WIDTH/8-1:0]  m_axis_tkeep,
+    output wire [AXIS_DATA_WIDTH/32-1:0] m_axis_tkeep,   // PG343: tkeep is per-DWORD
     output wire                          m_axis_tvalid,
     output wire                          m_axis_tlast,
     output wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser,
@@ -45,6 +45,17 @@ localparam MRD_TYPE = 4'b0000;
 
 // Address width for telemetry buffer
 localparam ADDR_WIDTH = $clog2(TELEMETRY_DEPTH);
+
+// Max value the ADDR_WIDTH-wide valid-entry counter may hold.  A ring that
+// tracks occupancy with (write_ptr - read_ptr) and no separate "full" bit
+// tops out at DEPTH-1.  Computed as DEPTH[ADDR_WIDTH-1:0]-1 this is all-ones
+// for power-of-two depths and DEPTH-1 otherwise.
+//
+// (The old saturation test compared `r_valid_count < TELEMETRY_DEPTH[ADDR_WIDTH-1:0]`.
+//  For a power-of-two DEPTH — e.g. the default 512 — TELEMETRY_DEPTH[ADDR_WIDTH-1:0]
+//  is 0, so the test was `< 0`, the count never advanced past 0, and the
+//  streamer replayed nothing but zeros on every window.)
+localparam [ADDR_WIDTH-1:0] VALID_COUNT_MAX = TELEMETRY_DEPTH[ADDR_WIDTH-1:0] - 1'b1;
 
 // -----------------------------------------------------------------------------
 // tuser sideband field offsets (LSB of each field).
@@ -86,7 +97,6 @@ localparam ACTUAL_ILA_DEPTH = (ILA_DEPTH == 0) ? STREAM_DURATION : ILA_DEPTH;
 wire [3:0]    request_type;
 wire [1:0]    address_type;
 wire [61:0]   address_full;
-wire [31:0]   address_msb;
 wire [7:0]    tag;
 wire [1:0]    sop;
 wire [1:0]    eop;
@@ -95,8 +105,10 @@ wire [10:0]   dword_count;
 
 assign request_type = s_axis_tdata[78:75];
 assign address_type = s_axis_tdata[1:0];
+// Full descriptor address field: Address[61:0] is a DWORD address, i.e. byte
+// address bits [63:2].  Byte address [1:0] is not carried here — it is implied
+// by first_be in tuser — so the recorded address resolves to a DWORD.
 assign address_full = s_axis_tdata[63:2];
-assign address_msb  = address_full[61:30];  // Top 32 bits of the 62-bit address field
 assign tag          = s_axis_tdata[103:96];
 assign sop          = s_axis_tuser[SOP_LO    + 1 : SOP_LO];
 assign eop          = s_axis_tuser[EOP_LO    + 1 : EOP_LO];
@@ -104,9 +116,21 @@ assign eop_ptr      = s_axis_tuser[EOPPTR_LO + 3 : EOPPTR_LO];
 assign dword_count  = s_axis_tdata[74:64];  // DW count field for MWr/MRd (11 bits, 0-1024 per PG343)
 
 // Transaction handshake (monitoring the passthrough)
+//
+// Straddle is DISABLED on this interface.  Per PG343 the tuser is_sop/is_eop
+// sideband fields are *optional* when straddle is off (RQ §3.2: "new TLP always
+// starts after tlast") and are typically tied low by the upstream, so they
+// cannot be used to frame packets.  Derive framing from the AXI-S handshake:
+//   EOP = tlast — the authoritative end-of-TLP marker when straddle is off.
+//         (|eop is OR'd in only so a future straddle-enabled build still works.)
+//   SOP = the first accepted beat of a new packet, i.e. a beat that fires while
+//         we are not already inside a packet (r_in_packet == 0).
+reg  r_in_packet;   // 1 = currently processing a packet (declared here so the
+                    // is_sop expression below may reference it — Verilog forbids
+                    // use-before-declaration)
 wire beat_fire = s_axis_tvalid && m_axis_tready;
-wire is_sop    = beat_fire && (|sop);   // catch SOP on either segment (tuser is_sop field)
-wire is_eop    = beat_fire && ((|eop) | (s_axis_tlast));   // use tuser is_eop field, not tlast
+wire is_eop    = beat_fire && (s_axis_tlast || (|eop));
+wire is_sop    = beat_fire && !r_in_packet;
 
 // Type checks
 wire is_mwr = (request_type == MWR_TYPE);
@@ -116,15 +140,14 @@ wire is_mrd = (request_type == MRD_TYPE);
 // Telemetry Collection Registers
 // =================================================================
 
-// Packet tracking
+// Packet tracking (r_in_packet is declared up with the handshake wires above)
 reg [DATA_FIDELITY-1:0]  r_beat_count;       // Current packet beat counter
 reg [DATA_FIDELITY-1:0]  r_gap_count;        // Gap counter between packets
-reg                      r_in_packet;        // 1 = currently processing a packet
 reg                      r_gap_active;       // 1 = counting gap after EOP
 
 // Current packet info (captured on SOP)
 reg [3:0]                r_cur_pkt_type;
-reg [31:0]               r_cur_pkt_addr;
+reg [61:0]               r_cur_pkt_addr;     // Full Address[61:0] (DWORD address)
 reg [7:0]                r_cur_pkt_tag;
 reg [1:0]                r_cur_addr_type;
 reg [10:0]               r_cur_dword_count;
@@ -134,11 +157,15 @@ reg [10:0]               r_cur_dword_count;
 //   [7:0]     pkt_length
 //   [15:8]    pkt_gap
 //   [19:16]   pkt_type
-//   [51:20]   pkt_addr
-//   [59:52]   payload_dw
-//   [67:60]   pkt_tag
-//   [69:68]   addr_type
-localparam TEL_ENTRY_WIDTH = 70;  // Total packed width
+//   [81:20]   pkt_addr     (full Address[61:0], DWORD address)
+//   [89:82]   payload_dw
+//   [97:90]   pkt_tag
+//   [99:98]   addr_type
+//
+// NOTE: these slices are literal constants and do NOT track DATA_FIDELITY.
+// The layout is only valid for DATA_FIDELITY == 8; changing that parameter
+// desynchronises the pack expression from the unpack wires below.
+localparam TEL_ENTRY_WIDTH = 100;  // Total packed width
 
 // Use XPM Block RAM for better synthesis and routing
 wire                        mem_ena;
@@ -173,7 +200,7 @@ reg                      tel_valid;          // High when data is valid (2-cycle
 reg [DATA_FIDELITY-1:0]  tel_pkt_length;     // Packet length in beats
 reg [DATA_FIDELITY-1:0]  tel_pkt_gap;        // Gap between packets in cycles
 reg [3:0]                tel_pkt_type;       // Request type field [78:75]
-reg [31:0]               tel_pkt_addr;       // MSB 32 bits of address (MWr/MRd only)
+reg [61:0]               tel_pkt_addr;       // Full Address[61:0] (DWORD address)
 reg [DATA_FIDELITY-1:0]  tel_payload_dw;     // Payload size in DWORDs (MWr only)
 reg [7:0]                tel_pkt_tag;        // PCIe tag [103:96]
 reg [1:0]                tel_addr_type;      // Address type [1:0]
@@ -243,21 +270,38 @@ assign mem_wea   = r_mem_wea;
 assign mem_addra = r_mem_addra;
 assign mem_dina  = r_mem_dina;
 
-// BRAM read port control
-reg                     r_mem_enb;
-reg [ADDR_WIDTH-1:0]    r_mem_addrb;
-
-assign mem_enb   = r_mem_enb;
-assign mem_addrb = r_mem_addrb;
+// BRAM read port control.
+//
+// Present the read address COMBINATIONALLY during ST_READ_REQ so that the
+// 1-cycle BRAM read latency lands the data in ST_STREAM_V1, where it is
+// latched.  (Previously addrb/enb were registered inside ST_READ_REQ, so they
+// only took effect in V1 and doutb was not valid until V2 — the V1 latch then
+// captured the *previous* entry.  That shifted the whole window by one slot:
+// the first slot showed stale data and the last buffered packet was dropped
+// and emitted as zero.)
+assign mem_enb   = (r_stream_state == ST_READ_REQ) &&
+                   (r_stream_pkt_cnt < r_valid_count);
+assign mem_addrb = r_read_ptr;
 
 // Unpack read data (registered output from BRAM, already has 1 cycle latency)
 wire [DATA_FIDELITY-1:0] mem_rd_pkt_length  = mem_doutb[7:0];
 wire [DATA_FIDELITY-1:0] mem_rd_pkt_gap     = mem_doutb[15:8];
 wire [3:0]               mem_rd_pkt_type    = mem_doutb[19:16];
-wire [31:0]              mem_rd_pkt_addr    = mem_doutb[51:20];
-wire [DATA_FIDELITY-1:0] mem_rd_payload_dw  = mem_doutb[59:52];
-wire [7:0]               mem_rd_pkt_tag     = mem_doutb[67:60];
-wire [1:0]               mem_rd_addr_type   = mem_doutb[69:68];
+wire [61:0]              mem_rd_pkt_addr    = mem_doutb[81:20];
+wire [DATA_FIDELITY-1:0] mem_rd_payload_dw  = mem_doutb[89:82];
+wire [7:0]               mem_rd_pkt_tag     = mem_doutb[97:90];
+wire [1:0]               mem_rd_addr_type   = mem_doutb[99:98];
+
+// Effective per-packet metadata used by the EOP write.  For a single-beat
+// packet is_sop and is_eop fire on the same cycle, so the r_cur_* capture
+// registers (written in the SOP branch below) have NOT yet updated and still
+// hold the *previous* packet's values.  Select the live decode in that case
+// so a 1-beat packet stores its own type/addr/tag/dword_count.
+wire [3:0]  eff_pkt_type = is_sop ? request_type : r_cur_pkt_type;
+wire [61:0] eff_pkt_addr = is_sop ? address_full : r_cur_pkt_addr;
+wire [7:0]  eff_pkt_tag  = is_sop ? tag          : r_cur_pkt_tag;
+wire [1:0]  eff_addr_typ = is_sop ? address_type : r_cur_addr_type;
+wire [10:0] eff_dw_count = is_sop ? dword_count  : r_cur_dword_count;
 
 // =================================================================
 // Packet Collection Process
@@ -274,7 +318,7 @@ always @(posedge clk or negedge rst_n) begin
         r_in_packet       <= 1'b0;
         r_gap_active      <= 1'b0;
         r_cur_pkt_type    <= 4'd0;
-        r_cur_pkt_addr    <= 32'd0;
+        r_cur_pkt_addr    <= 62'd0;
         r_cur_pkt_tag     <= 8'd0;
         r_cur_addr_type   <= 2'd0;
         r_cur_dword_count <= 11'd0;
@@ -306,13 +350,13 @@ always @(posedge clk or negedge rst_n) begin
             r_cur_addr_type   <= address_type;
             r_cur_dword_count <= dword_count;
             
-            // Capture address MSB for all packet types
-            r_cur_pkt_addr <= address_msb;
+            // Capture the full address for all packet types
+            r_cur_pkt_addr <= address_full;
                 
         // ----------------------------------------------------------
         // Mid-packet beat (not EOP; EOP beat counted at write time)
         // ----------------------------------------------------------
-        end else if (r_in_packet && beat_fire && !(|eop)) begin
+        end else if (r_in_packet && beat_fire && !is_eop) begin
             // Increment beat counter (saturate at max)
             if (r_beat_count < {DATA_FIDELITY{1'b1}})
                 r_beat_count <= r_beat_count + 1'b1;
@@ -327,14 +371,14 @@ always @(posedge clk or negedge rst_n) begin
             // Beat count: include the EOP beat itself (+1), except for single-beat
             // packets where is_sop fires on the same cycle (store 1 directly).
             r_mem_dina <= {
-                r_cur_addr_type,      // [69:68]
-                r_cur_pkt_tag,        // [67:60]
-                (r_cur_pkt_type == MWR_TYPE) ?  // [59:52] payload_dw
-                    ((r_cur_dword_count[10:0] > {{(11-DATA_FIDELITY){1'b0}}, {DATA_FIDELITY{1'b1}}}) ?
-                        {DATA_FIDELITY{1'b1}} : r_cur_dword_count[DATA_FIDELITY-1:0]) :
+                eff_addr_typ,         // [99:98]
+                eff_pkt_tag,          // [97:90]
+                (eff_pkt_type == MWR_TYPE) ?  // [89:82] payload_dw
+                    ((eff_dw_count[10:0] > {{(11-DATA_FIDELITY){1'b0}}, {DATA_FIDELITY{1'b1}}}) ?
+                        {DATA_FIDELITY{1'b1}} : eff_dw_count[DATA_FIDELITY-1:0]) :
                     {DATA_FIDELITY{1'b0}},
-                r_cur_pkt_addr,       // [51:20]
-                r_cur_pkt_type,       // [19:16]
+                eff_pkt_addr,         // [81:20]
+                eff_pkt_type,         // [19:16]
                 r_gap_count,          // [15:8]
                 is_sop ? {{(DATA_FIDELITY-1){1'b0}}, 1'b1}  // single-beat packet
                        : (r_beat_count < {DATA_FIDELITY{1'b1}} ? r_beat_count + 1'b1
@@ -346,8 +390,8 @@ always @(posedge clk or negedge rst_n) begin
             // Advance write pointer (ring buffer)
             r_write_ptr <= r_write_ptr + 1'b1;
             
-            // Update valid count (saturate at TELEMETRY_DEPTH)
-            if (r_valid_count < TELEMETRY_DEPTH[ADDR_WIDTH-1:0])
+            // Update valid count (saturate at DEPTH-1; see VALID_COUNT_MAX)
+            if (r_valid_count < VALID_COUNT_MAX)
                 r_valid_count <= r_valid_count + 1'b1;
             
             // Update statistics
@@ -410,14 +454,12 @@ always @(posedge clk or negedge rst_n) begin
         r_stream_counter <= 16'd0;
         r_stream_pkt_cnt <= {ADDR_WIDTH{1'b0}};
         r_read_ptr       <= {ADDR_WIDTH{1'b0}};
-        r_mem_enb        <= 1'b0;
-        r_mem_addrb      <= {ADDR_WIDTH{1'b0}};
         tel_enable       <= 1'b0;
         tel_valid        <= 1'b0;
         tel_pkt_length   <= {DATA_FIDELITY{1'b0}};
         tel_pkt_gap      <= {DATA_FIDELITY{1'b0}};
         tel_pkt_type     <= 4'd0;
-        tel_pkt_addr     <= 32'd0;
+        tel_pkt_addr     <= 62'd0;
         tel_payload_dw   <= {DATA_FIDELITY{1'b0}};
         tel_pkt_tag      <= 8'd0;
         tel_addr_type    <= 2'd0;
@@ -435,8 +477,7 @@ always @(posedge clk or negedge rst_n) begin
             ST_COLLECT: begin
                 tel_enable <= 1'b0;
                 tel_valid  <= 1'b0;
-                r_mem_enb  <= 1'b0;
-                
+
                 if (r_stream_counter < (STREAM_GAP - 1)) begin
                     r_stream_counter <= r_stream_counter + 1'b1;
                 end else begin
@@ -450,19 +491,13 @@ always @(posedge clk or negedge rst_n) begin
 
             // --------------------------------------------------
             // READ_REQ: Issue BRAM read request
-            // Data will be available next cycle
+            // The address/enable are driven combinationally (see the mem_enb /
+            // mem_addrb assigns) from this state, so mem[r_read_ptr] is being
+            // fetched this cycle and lands on doutb next cycle (ST_STREAM_V1).
             // --------------------------------------------------
             ST_READ_REQ: begin
                 tel_enable <= 1'b1;
-                
-                if (r_stream_pkt_cnt < r_valid_count) begin
-                    // Issue read request
-                    r_mem_enb   <= 1'b1;
-                    r_mem_addrb <= r_read_ptr;
-                end else begin
-                    r_mem_enb <= 1'b0;
-                end
-                
+
                 r_stream_state   <= ST_STREAM_V1;
                 r_stream_counter <= r_stream_counter + 1'b1;
             end
@@ -488,7 +523,7 @@ always @(posedge clk or negedge rst_n) begin
                     tel_pkt_length  <= {DATA_FIDELITY{1'b0}};
                     tel_pkt_gap     <= {DATA_FIDELITY{1'b0}};
                     tel_pkt_type    <= 4'd0;
-                    tel_pkt_addr    <= 32'd0;
+                    tel_pkt_addr    <= 62'd0;
                     tel_payload_dw  <= {DATA_FIDELITY{1'b0}};
                     tel_pkt_tag     <= 8'd0;
                     tel_addr_type   <= 2'd0;
@@ -527,22 +562,22 @@ always @(posedge clk or negedge rst_n) begin
             end
 
             // --------------------------------------------------
-            // STREAM_I2: Second invalid cycle, advance to next packet
-            // Issue next BRAM read request here
+            // STREAM_I2: Second invalid cycle, advance to next packet.
+            // The next read is issued combinationally when the FSM re-enters
+            // ST_READ_REQ with the just-incremented r_read_ptr.
             // --------------------------------------------------
             ST_STREAM_I2: begin
                 tel_enable <= 1'b1;
                 tel_valid  <= 1'b0;
-                
+
                 r_read_ptr       <= r_read_ptr + 1'b1;
                 r_stream_pkt_cnt <= r_stream_pkt_cnt + 1'b1;
                 r_stream_counter <= r_stream_counter + 1'b1;
-                
+
                 // Check if streaming window complete
                 if (r_stream_counter >= (STREAM_DURATION - 1)) begin
                     r_stream_state   <= ST_COLLECT;
                     r_stream_counter <= 16'd0;
-                    r_mem_enb        <= 1'b0;
                 end else begin
                     // Continue streaming - go to READ_REQ for next packet
                     r_stream_state <= ST_READ_REQ;
@@ -575,6 +610,13 @@ end
 // Create with Vivado TCL:
 //   See comments below for automated IP generation script
 
+// Probe10 carries the address as a full 64-bit BYTE address so it can be read
+// directly off the waveform without a mental shift.  tel_pkt_addr holds
+// Address[61:0] (a DWORD address = byte address [63:2]), so the low two bits
+// are appended as zero; the true byte offset within the DWORD is implied by
+// first_be and is not recorded.
+wire [63:0] tel_pkt_addr_byte = {tel_pkt_addr, 2'b00};
+
 generate
     if (ENABLE_ILA == 1) begin : gen_ila
         ila_0 u_ila_telemetry (
@@ -595,7 +637,7 @@ generate
             .probe7  (tel_pkt_length),     // [7:0]   Packet length in beats
             .probe8  (tel_pkt_gap),        // [7:0]   Gap between packets (cycles)
             .probe9  (tel_pkt_type),       // [3:0]   PCIe request type
-            .probe10 (tel_pkt_addr),       // [31:0]  Packet address (MSB 32 bits)
+            .probe10 (tel_pkt_addr_byte), // [63:0]  Packet byte address (full)
             .probe11 (tel_payload_dw),     // [7:0]   Payload size in DWORDs
             .probe12 (tel_pkt_tag),        // [7:0]   PCIe transaction tag
             .probe13 (tel_addr_type),      // [1:0]   Address type
@@ -631,7 +673,7 @@ endgenerate
 //   CONFIG.C_PROBE7_WIDTH {8} \
 //   CONFIG.C_PROBE8_WIDTH {8} \
 //   CONFIG.C_PROBE9_WIDTH {4} \
-//   CONFIG.C_PROBE10_WIDTH {32} \
+//   CONFIG.C_PROBE10_WIDTH {64} \
 //   CONFIG.C_PROBE11_WIDTH {8} \
 //   CONFIG.C_PROBE12_WIDTH {8} \
 //   CONFIG.C_PROBE13_WIDTH {2} \
@@ -656,6 +698,12 @@ endgenerate
 //   256 packets  -> 1024 depth
 //   512 packets  -> 2048 depth (default)
 //   1024 packets -> 4096 depth
+//
+// IMPORTANT: probe10 widened from 32 to 64 bits when the telemetry moved to
+// full-address capture.  An ila_0 core generated before that change has a
+// 32-bit probe10 and will fail elaboration with a port width mismatch.
+// Re-run the script above (or reset_target/generate_target on the existing IP)
+// so the core is rebuilt at the new width.
 // =================================================================
 
 endmodule

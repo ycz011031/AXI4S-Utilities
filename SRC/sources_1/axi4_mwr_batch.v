@@ -1,7 +1,7 @@
 module axi4_mwr_batch #(
     parameter integer AXIS_DATA_WIDTH  = 512,
     parameter integer AXIS_TUSER_WIDTH = 183,
-    parameter integer AXIS_FIFO_WIDTH  = AXIS_DATA_WIDTH + AXIS_TUSER_WIDTH + 2, // Data + TUSER + SOP/EOP
+    parameter integer AXIS_FIFO_WIDTH  = AXIS_DATA_WIDTH + AXIS_TUSER_WIDTH + AXIS_DATA_WIDTH/32 + 2, // Data + TUSER + TKEEP + SOP/EOP
     parameter integer FIFO_DEPTH       = 128,
     parameter integer TIME_FEDILITY = 8,
     parameter integer DEPTH_FEDILITY = 8,
@@ -15,7 +15,7 @@ module axi4_mwr_batch #(
 
     // AXX4 Slave AXIS interface 0
     input  wire [AXIS_DATA_WIDTH-1:0]    s_axis_tdata_0,
-    input  wire [AXIS_DATA_WIDTH/8-1:0]  s_axis_tkeep_0,
+    input  wire [AXIS_DATA_WIDTH/32-1:0] s_axis_tkeep_0,   // PG343: tkeep is per-DWORD
     input  wire                          s_axis_tvalid_0,
     input  wire                          s_axis_tlast_0,
     input  wire [AXIS_TUSER_WIDTH-1:0]   s_axis_tuser_0,
@@ -23,7 +23,7 @@ module axi4_mwr_batch #(
 
     // AXX4 Slave AXIS interface 1
     input  wire [AXIS_DATA_WIDTH-1:0]    s_axis_tdata_1,
-    input  wire [AXIS_DATA_WIDTH/8-1:0]  s_axis_tkeep_1,
+    input  wire [AXIS_DATA_WIDTH/32-1:0] s_axis_tkeep_1,   // PG343: tkeep is per-DWORD
     input  wire                          s_axis_tvalid_1,
     input  wire                          s_axis_tlast_1,
     input  wire [AXIS_TUSER_WIDTH-1:0]   s_axis_tuser_1,
@@ -31,7 +31,7 @@ module axi4_mwr_batch #(
 
     // AXI4 Master Read Address Channel
     output wire [AXIS_DATA_WIDTH-1:0]    m_axis_tdata,
-    output wire [AXIS_DATA_WIDTH/8-1:0]  m_axis_tkeep,
+    output wire [AXIS_DATA_WIDTH/32-1:0] m_axis_tkeep,    // PG343: tkeep is per-DWORD
     output wire                          m_axis_tvalid,
     output wire                          m_axis_tlast,
     output wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser,
@@ -49,6 +49,9 @@ module axi4_mwr_batch #(
 // =================================================================
 // Count width: $clog2(FIFO_DEPTH)+1  e.g. 8 bits for FIFO_DEPTH=128
 localparam integer FIFO_CNT_W = $clog2(FIFO_DEPTH) + 1;
+
+// tkeep is per-DWORD (PG343): width = DATA_WIDTH/32 (16 for a 512-bit bus)
+localparam integer TKEEP_WIDTH = AXIS_DATA_WIDTH/32;
 
 // -----------------------------------------------------------------------------
 // prog_full (almost_full) backpressure headroom.
@@ -297,14 +300,18 @@ localparam MWR_TYPE = 4'b0001;
 
 // =================================================================
 // FIFO Data Packing
-// Format: { tlast[1], sop[1], tuser[AXIS_TUSER_WIDTH], tdata[AXIS_DATA_WIDTH] }
-// Total  = 1 + 1 + 183 + 512 = 697 = AXIS_FIFO_WIDTH
+// Format: { tkeep[TKEEP_WIDTH], tlast[1], sop[1], tuser[AXIS_TUSER_WIDTH], tdata[AXIS_DATA_WIDTH] }
+//
+// tkeep is carried verbatim through the FIFO.  Straddle is OFF, so per PG343
+// s_axis_tkeep is the authoritative per-DWORD valid indicator for the EOP beat;
+// it must be preserved rather than reconstructed from the straddle-only
+// is_eop0_ptr sideband (which is undriven/0 when straddle is disabled).
 // =================================================================
 wire [AXIS_FIFO_WIDTH-1:0] pack_ch0;
 wire [AXIS_FIFO_WIDTH-1:0] pack_ch1;
 
-assign pack_ch0 = {s_axis_tlast_0, sop_0[0], s_axis_tuser_0, s_axis_tdata_0};
-assign pack_ch1 = {s_axis_tlast_1, sop_1[0], s_axis_tuser_1, s_axis_tdata_1};
+assign pack_ch0 = {s_axis_tkeep_0, s_axis_tlast_0, sop_0[0], s_axis_tuser_0, s_axis_tdata_0};
+assign pack_ch1 = {s_axis_tkeep_1, s_axis_tlast_1, sop_1[0], s_axis_tuser_1, s_axis_tdata_1};
 
 // =================================================================
 // Internal Registers
@@ -318,45 +325,120 @@ reg                         r_wr_en_1_r;
 reg  [AXIS_FIFO_WIDTH-1:0] r_fifo2_din;
 reg                         r_wr_en_2_r;
 
-// One-beat cache for FIFO 2 arbitration.
-// Needed when both channels present a non-MWr beat in the same cycle;
-// channel 0 wins and channel 1's beat is held here until FIFO 2 is free.
-reg  [AXIS_FIFO_WIDTH-1:0] r_cache2_data;
-reg                         r_cache2_valid; // 1 = cache holds a pending beat
-reg                         r_cache2_ch;    // 0 = buffered from ch0, 1 = from ch1
+// FIFO 2 packet-ownership lock.
+// Once a channel begins writing a (multi-beat) non-MWr packet into the shared
+// FIFO 2, it owns FIFO 2 until that packet's EOP.  This keeps every FIFO-2
+// packet contiguous — without it, beats from two concurrent non-MWr packets
+// (one per channel) would interleave into a single corrupted output packet.
+reg                         r_f2_lock;     // 1 = a channel owns FIFO 2
+reg                         r_f2_lock_ch;  // owning channel (0 or 1)
+
+// Per-channel MWr/non-MWr packet-type latch.
+// request_type (tdata[78:75]) lives in the SOP/descriptor beat only; on the
+// payload beats of a multi-beat packet those bits are arbitrary.  Latch the type
+// decided at SOP and hold it to EOP so every beat of a packet routes to the same
+// FIFO and the ready/ordering logic sees one stable type.  Mirrors r_f2_lock.
+reg                         r_ch0_inpkt;    // 1 = ch0 mid-packet (SOP seen, EOP not yet)
+reg                         r_ch0_type_mwr; // latched is_mwr for the current ch0 packet
+reg                         r_ch1_inpkt;
+reg                         r_ch1_type_mwr;
 
 // =================================================================
 // Type Detection Wires
+//
+// is_mwr_x is the LIVE descriptor decode — valid only in the SOP beat.
+// ch_x_eff_mwr is the per-beat EFFECTIVE type used by all routing/ready logic:
+// the live decode at SOP (r_chx_inpkt==0), or the latched type mid-packet.
 // =================================================================
 wire is_mwr_0 = (request_type_0 == MWR_TYPE);
 wire is_mwr_1 = (request_type_1 == MWR_TYPE);
 
+wire ch0_eff_mwr = r_ch0_inpkt ? r_ch0_type_mwr : is_mwr_0;
+wire ch1_eff_mwr = r_ch1_inpkt ? r_ch1_type_mwr : is_mwr_1;
+
 // =================================================================
 // Ready Signals — Combinatorial, Type-Aware
 //
-//  Backpressure gates on almost_full (prog_full), NOT raw full.  Because the
-//  write path is registered (accepted beat commits one cycle later) and
-//  prog_full has its own assertion latency, gating on full would let beats be
-//  accepted into a FIFO that has no room by the time the registered write
-//  commits — those writes overflow and are dropped.  prog_full reserves
-//  PROG_FULL_HEADROOM slots so every accepted beat is guaranteed a landing
-//  spot, and a started packet can stream to EOP without overflow.
+//  Backpressure gates on almost_full (prog_full), NOT raw full: the write path
+//  is registered (an accepted beat commits one cycle later) and prog_full has
+//  its own assertion latency.  prog_full reserves PROG_FULL_HEADROOM slots so
+//  every accepted beat has a landing spot and a started packet streams to EOP.
 //
-//  MWr path  (type 0001): ready when the dedicated FIFO (0 or 1) is not
-//                          almost-full.
-//  Non-MWr path          : ready when FIFO 2 is not almost-full AND the
-//                          one-beat cache is empty (cache full ⇒ FIFO 2 still
-//                          draining).
-//  valid=0               : assert ready optimistically; the correct gate will
-//                          fire on the cycle valid is presented.
+//  MWr path (type 0001): ready when the dedicated FIFO (0/1) is not almost-full.
+//
+//  Non-MWr path: ready only when ALL hold —
+//    • FIFO 2 not almost-full, AND
+//    • ORDERING BARRIER clear (ch_bar_ok): that channel's MWr FIFO is empty
+//      with no registered write in flight.  This stops a non-MWr request
+//      (e.g. a read) being admitted — and thus emitted — ahead of an earlier
+//      MWr on the same channel, which PCIe ordering forbids (a non-posted
+//      request may not pass an earlier posted one).
+//    • PACKET LOCK allows it: FIFO 2 free, or already owned by this channel.
+//      Channel 0 wins a free lock; channel 1 defers to a same-cycle ch0
+//      acquire.  This keeps each FIFO-2 packet contiguous (no cross-channel
+//      beat interleave).
+//
+//  valid=0: assert ready optimistically; the real gate fires when valid is.
 // =================================================================
-wire s_tready_0_w = s_axis_tvalid_0
-    ? (is_mwr_0 ? !almost_full_0 : (!almost_full_2 && !r_cache2_valid))
-    : 1'b1;
+// FIFO 2 packet-ownership lock state
+wire f2_free = !r_f2_lock;
+wire f2_own0 =  r_f2_lock && (r_f2_lock_ch == 1'b0);
+wire f2_own1 =  r_f2_lock && (r_f2_lock_ch == 1'b1);
 
-wire s_tready_1_w = s_axis_tvalid_1
-    ? (is_mwr_1 ? !almost_full_1 : (!almost_full_2 && !r_cache2_valid))
-    : 1'b1;
+// A channel has MWr still pending if any MWr beat it has accepted has not yet
+// been read back out of its FIFO.  This is tracked with an explicit in-flight
+// counter rather than `!empty || r_wr_en_r`.
+//
+// Why not `empty`: the xpm FWFT `empty` flag can lag the write by more than one
+// cycle.  During that lag `empty` still reads high while `r_wr_en_x_r` has
+// already cleared, so `!empty || r_wr_en_x_r` momentarily reports "drained"
+// while an MWr beat is actually in flight.  The ordering barrier below would
+// then admit a non-MWr into FIFO 2 ahead of that MWr; the FSM commits to that
+// FIFO-2 packet (MST_SERVE_2, r_in_pkt=1) but can never finish it, because the
+// rest of the packet now sits behind a (real) non-empty MWr FIFO that only the
+// blocked FSM could drain — a cyclic, permanent deadlock.
+//
+// The counter is exact and latency-independent: +1 when a beat's registered
+// write commits (r_wr_en_x_r), -1 when a beat is read out (rd_en_x).  ORing
+// r_wr_en_x_r into `pending` covers the commit cycle itself, before the
+// registered counter has incremented.  All terms are registered, so this
+// introduces no combinational path through the tready logic.
+reg [FIFO_CNT_W-1:0] r_mwr_inflight_0;
+reg [FIFO_CNT_W-1:0] r_mwr_inflight_1;
+
+wire ch0_mwr_pending = (r_mwr_inflight_0 != 0) || r_wr_en_0_r;
+wire ch1_mwr_pending = (r_mwr_inflight_1 != 0) || r_wr_en_1_r;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        r_mwr_inflight_0 <= {FIFO_CNT_W{1'b0}};
+        r_mwr_inflight_1 <= {FIFO_CNT_W{1'b0}};
+    end else begin
+        r_mwr_inflight_0 <= r_mwr_inflight_0 + (r_wr_en_0_r ? 1'b1 : 1'b0)
+                                             - (rd_en_0     ? 1'b1 : 1'b0);
+        r_mwr_inflight_1 <= r_mwr_inflight_1 + (r_wr_en_1_r ? 1'b1 : 1'b0)
+                                             - (rd_en_1     ? 1'b1 : 1'b0);
+    end
+end
+
+// Ordering barrier: a channel's non-MWr may enter FIFO 2 only once that
+// channel's MWr FIFO has fully drained.
+wire ch0_bar_ok = !ch0_mwr_pending;
+wire ch1_bar_ok = !ch1_mwr_pending;
+
+// A channel currently presenting a non-MWr beat.
+wire ch0_pres_nonmwr = s_axis_tvalid_0 && !ch0_eff_mwr;
+wire ch1_pres_nonmwr = s_axis_tvalid_1 && !ch1_eff_mwr;
+
+// Channel 0 is about to take a free lock this cycle (channel 1 must defer).
+wire ch0_wants_lock = ch0_pres_nonmwr && ch0_bar_ok && !almost_full_2;
+
+// Non-MWr ready, per channel: FIFO 2 room + barrier clear + lock available.
+wire ch0_nonmwr_ok = !almost_full_2 && ch0_bar_ok && (f2_own0 || f2_free);
+wire ch1_nonmwr_ok = !almost_full_2 && ch1_bar_ok && (f2_own1 || (f2_free && !ch0_wants_lock));
+
+wire s_tready_0_w = s_axis_tvalid_0 ? (ch0_eff_mwr ? !almost_full_0 : ch0_nonmwr_ok) : 1'b1;
+wire s_tready_1_w = s_axis_tvalid_1 ? (ch1_eff_mwr ? !almost_full_1 : ch1_nonmwr_ok) : 1'b1;
 
 assign s_axis_tready_0 = s_tready_0_w;
 assign s_axis_tready_1 = s_tready_1_w;
@@ -366,10 +448,10 @@ assign s_axis_tready_1 = s_tready_1_w;
 // =================================================================
 wire ch0_fire        = s_axis_tvalid_0 && s_tready_0_w;
 wire ch1_fire        = s_axis_tvalid_1 && s_tready_1_w;
-wire ch0_fire_mwr    = ch0_fire &&  is_mwr_0;
-wire ch1_fire_mwr    = ch1_fire &&  is_mwr_1;
-wire ch0_fire_nonmwr = ch0_fire && !is_mwr_0;
-wire ch1_fire_nonmwr = ch1_fire && !is_mwr_1;
+wire ch0_fire_mwr    = ch0_fire &&  ch0_eff_mwr;
+wire ch1_fire_mwr    = ch1_fire &&  ch1_eff_mwr;
+wire ch0_fire_nonmwr = ch0_fire && !ch0_eff_mwr;
+wire ch1_fire_nonmwr = ch1_fire && !ch1_eff_mwr;
 
 // =================================================================
 // FIFO Output Assignments (driven from registers)
@@ -404,7 +486,7 @@ reg [7:0] r_wait_1;    // same for FIFO 1
 reg       r_in_pkt;
 
 // --- Mux current FIFO data/empty based on active state ---
-// FIFO packing: { tlast[1], sop[1], tuser[AXIS_TUSER_WIDTH], tdata[AXIS_DATA_WIDTH] }
+// FIFO packing: { tkeep[TKEEP_WIDTH], tlast[1], sop[1], tuser[AXIS_TUSER_WIDTH], tdata[AXIS_DATA_WIDTH] }
 wire [AXIS_FIFO_WIDTH-1:0] cur_data;
 wire                        cur_empty;
 
@@ -419,22 +501,12 @@ assign cur_empty = (r_mst_state == MST_SERVE_0) ? empty_0 :
                    1'b1;
 
 // --- Unpack FIFO fields from cur_data ---
-wire                        cur_tlast  = cur_data[AXIS_FIFO_WIDTH-1];
+// tkeep is carried verbatim from the slave side (straddle off → s_axis_tkeep is
+// authoritative per PG343), not reconstructed from the straddle-only eop_ptr.
+wire [TKEEP_WIDTH-1:0]      cur_tkeep  = cur_data[AXIS_FIFO_WIDTH-1 : AXIS_DATA_WIDTH + AXIS_TUSER_WIDTH + 2];
+wire                        cur_tlast  = cur_data[AXIS_DATA_WIDTH + AXIS_TUSER_WIDTH + 1];
 wire [AXIS_TUSER_WIDTH-1:0] cur_tuser  = cur_data[AXIS_DATA_WIDTH + AXIS_TUSER_WIDTH - 1 : AXIS_DATA_WIDTH];
 wire [AXIS_DATA_WIDTH-1:0]  cur_tdata  = cur_data[AXIS_DATA_WIDTH-1:0];
-
-// eop_ptr: byte index (0-based) of the last valid byte in this beat
-// stored in tuser[EOPPTR_LO+3:EOPPTR_LO] per the slave-side decode (CQ/RQ)
-wire [3:0] cur_eop_ptr = cur_tuser[EOPPTR_LO + 3 : EOPPTR_LO];
-
-// --- TKEEP Recovery ---
-// Non-EOP beat : every byte is valid → all 1s
-// EOP beat     : bytes 0..eop_ptr are valid → (1 << (eop_ptr+1)) - 1
-//   e.g. eop_ptr=11 → 64'h0000_0000_0000_0FFF
-//   e.g. eop_ptr=63 → 64'hFFFF_FFFF_FFFF_FFFF  (overflow wraps: (1<<64)-1 = all-1s)
-wire [AXIS_DATA_WIDTH/8-1:0] cur_tkeep =
-    cur_tlast ? ((64'h1 << (cur_eop_ptr + 1)) - 64'h1)
-              : {(AXIS_DATA_WIDTH/8){1'b1}};
 
 // --- AXI-S master handshake ---
 wire cur_valid = (r_mst_state != MST_IDLE) && !cur_empty;
@@ -463,16 +535,15 @@ assign rd_en_2 = (r_mst_state == MST_SERVE_2) && cur_fire;
 //       ch0 beat → FIFO 0
 //       ch1 beat → FIFO 1
 //   • All other request types → FIFO 2
-//       FIFO 2 is shared; if both channels fire a non-MWr beat in the
-//       same cycle, channel 0 is written directly while channel 1 is
-//       stored in r_cache2.  The cache is drained on the next cycle
-//       where no new non-MWr activity is present and FIFO 2 has space.
+//       FIFO 2 is shared, but a packet-ownership lock (r_f2_lock) grants it to
+//       one channel for the duration of a non-MWr packet, so beats from the
+//       two channels never interleave within a FIFO-2 packet.
 //
-// Ready de-assertion:
-//   • FIFO 0/1 full → back-pressures MWr on the respective channel.
-//   • FIFO 2 full   → back-pressures non-MWr on both channels.
-//   • Cache valid   → back-pressures non-MWr on both channels until
-//                     the cached beat is drained into FIFO 2.
+// Ready de-assertion (non-MWr):
+//   • FIFO 2 almost-full        → back-pressures non-MWr on both channels.
+//   • Lock held by other channel→ back-pressures the non-owning channel.
+//   • Ordering barrier not clear→ back-pressures a channel's non-MWr until
+//                                 that channel's MWr FIFO has drained.
 // =================================================================
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -482,9 +553,12 @@ always @(posedge clk or negedge rst_n) begin
         r_wr_en_1_r           <= 1'b0;
         r_fifo2_din           <= {AXIS_FIFO_WIDTH{1'b0}};
         r_wr_en_2_r           <= 1'b0;
-        r_cache2_data         <= {AXIS_FIFO_WIDTH{1'b0}};
-        r_cache2_valid        <= 1'b0;
-        r_cache2_ch           <= 1'b0;
+        r_f2_lock             <= 1'b0;
+        r_f2_lock_ch          <= 1'b0;
+        r_ch0_inpkt           <= 1'b0;
+        r_ch0_type_mwr        <= 1'b0;
+        r_ch1_inpkt           <= 1'b0;
+        r_ch1_type_mwr        <= 1'b0;
     end else begin
 
         // ----------------------------------------------------------
@@ -511,44 +585,56 @@ always @(posedge clk or negedge rst_n) begin
         end
 
         // ----------------------------------------------------------
-        // FIFO 2 — Non-MWr beats, arbitrated between ch0 and ch1
+        // FIFO 2 — Non-MWr beats.
         //
-        // Backpressure invariant (enforced by ready logic above):
-        //   When r_cache2_valid == 1, both channel readys for non-MWr
-        //   are deasserted, so ch0_fire_nonmwr and ch1_fire_nonmwr
-        //   are both 0.  The cache can therefore never be overwritten.
-        //
-        // Arbitration on conflict (both fire in the same cycle):
-        //   Channel 0 has priority → written directly to FIFO 2.
-        //   Channel 1 is buffered  → stored in r_cache2.
-        //   Next idle cycle the cache is drained first.
+        // The packet-ownership lock plus channel-0 priority (enforced by the
+        // ready logic) guarantee at most one channel fires a non-MWr beat in
+        // any cycle, and that all beats of a packet arrive from the same
+        // channel back-to-back.  So a plain two-way write — no cache — keeps
+        // every FIFO-2 packet contiguous.
         // ----------------------------------------------------------
-        if (!ch0_fire_nonmwr && !ch1_fire_nonmwr) begin
-            // No new non-MWr this cycle — drain pending cache if space available
-            if (r_cache2_valid && !full_2) begin
-                r_fifo2_din    <= r_cache2_data;
-                r_wr_en_2_r    <= 1'b1;
-                r_cache2_valid <= 1'b0;
-            end
-
-        end else if (ch0_fire_nonmwr && !ch1_fire_nonmwr) begin
-            // Channel 0 non-MWr only — direct write; cache guaranteed empty
+        if (ch0_fire_nonmwr) begin
             r_fifo2_din <= pack_ch0;
             r_wr_en_2_r <= 1'b1;
-
-        end else if (!ch0_fire_nonmwr && ch1_fire_nonmwr) begin
-            // Channel 1 non-MWr only — direct write; cache guaranteed empty
+        end else if (ch1_fire_nonmwr) begin
             r_fifo2_din <= pack_ch1;
             r_wr_en_2_r <= 1'b1;
+        end
 
-        end else begin
-            // Conflict: both channels fire non-MWr in the same cycle.
-            // Channel 0 wins → FIFO 2.  Channel 1 → one-beat cache.
-            r_fifo2_din           <= pack_ch0;
-            r_wr_en_2_r           <= 1'b1;
-            r_cache2_data         <= pack_ch1;
-            r_cache2_valid        <= 1'b1;
-            r_cache2_ch           <= 1'b1;   // cache holds ch1 data
+        // ----------------------------------------------------------
+        // FIFO 2 ownership lock: taken on a multi-beat non-MWr SOP, released
+        // on its EOP.  A single-beat packet never locks (the acquire and
+        // release collapse into the EOP-clear, which wins).
+        // ----------------------------------------------------------
+        if (ch0_fire_nonmwr) begin
+            if (s_axis_tlast_0)        r_f2_lock <= 1'b0;
+            else if (!r_f2_lock) begin r_f2_lock <= 1'b1; r_f2_lock_ch <= 1'b0; end
+        end else if (ch1_fire_nonmwr) begin
+            if (s_axis_tlast_1)        r_f2_lock <= 1'b0;
+            else if (!r_f2_lock) begin r_f2_lock <= 1'b1; r_f2_lock_ch <= 1'b1; end
+        end
+
+        // ----------------------------------------------------------
+        // Per-channel packet-type latch.
+        // Capture is_mwr from the SOP/descriptor beat and hold it across the
+        // packet's payload beats; clear at EOP.  Keyed on ch_x_fire so it
+        // tracks accepted beats only.  A single-beat packet (SOP==EOP) clears
+        // without ever setting r_chx_inpkt, so its type comes from the live
+        // decode — exactly as the master/ready logic uses it.
+        // ----------------------------------------------------------
+        if (ch0_fire) begin
+            if (s_axis_tlast_0)         r_ch0_inpkt <= 1'b0;
+            else if (!r_ch0_inpkt) begin
+                r_ch0_inpkt    <= 1'b1;
+                r_ch0_type_mwr <= is_mwr_0;
+            end
+        end
+        if (ch1_fire) begin
+            if (s_axis_tlast_1)         r_ch1_inpkt <= 1'b0;
+            else if (!r_ch1_inpkt) begin
+                r_ch1_inpkt    <= 1'b1;
+                r_ch1_type_mwr <= is_mwr_1;
+            end
         end
 
     end
@@ -631,23 +717,33 @@ end
 //
 // Priority order:
 //   1. FIFO 2 (non-MWr): always interleaves when it has data — even mid-burst.
-//   2. FIFO 0 / FIFO 1 (MWr batched): served only when a trigger is active.
+//   2. FIFO 0 / FIFO 1 (MWr batched): served when a batching trigger is active
+//      (depth/timeout) OR when a non-MWr is stalled behind it on the same
+//      channel and must be flushed first to honour PCIe ordering.  The flush
+//      request drains the channel's MWr FIFO so the ordering barrier in the
+//      ready logic (ch_bar_ok) can release the waiting non-MWr.
 //      Tie-breaking when both triggered simultaneously:
 //        • Any timeout flag asserted  → FIFO 1 always wins
-//        • Both depth-only (no TO)    → higher aging count (older) wins
+//        • Otherwise                  → higher aging count (older) wins
 //
 // Combinatorial; uses r_wait_0/r_wait_1 and priority_x registered outputs.
+wire ch0_flush_req = ch0_pres_nonmwr && ch0_mwr_pending; // non-MWr behind ch0 MWr
+wire ch1_flush_req = ch1_pres_nonmwr && ch1_mwr_pending; // non-MWr behind ch1 MWr
+
+wire trig_0 = (|priority_0) || ch0_flush_req;
+wire trig_1 = (|priority_1) || ch1_flush_req;
+
 reg [1:0] arb_src;
 always @(*) begin
     if (!empty_2) begin
         arb_src = MST_SERVE_2;              // FIFO 2 interleave takes precedence
     end else begin
-        case ({|priority_1, |priority_0})
+        case ({trig_1, trig_0})
             2'b11: begin                    // Both FIFO 0 and 1 triggered — tie-break
                 if (priority_0[0] || priority_1[0])
                     arb_src = MST_SERVE_1;  // any timeout event → FIFO 1 wins
                 else
-                    // Pure depth tie → serve the one that has been waiting longer
+                    // Serve the one that has been waiting longer
                     arb_src = (r_wait_0 >= r_wait_1) ? MST_SERVE_0 : MST_SERVE_1;
             end
             2'b10:   arb_src = MST_SERVE_1; // only FIFO 1 triggered

@@ -41,7 +41,7 @@ module axi4_mwr_batch_top #(
 
     // -------- Slave input port 0 (RQ) --------
     input  wire [AXIS_DATA_WIDTH-1:0]    s_axis_tdata_0,
-    input  wire [AXIS_DATA_WIDTH/8-1:0]  s_axis_tkeep_0,
+    input  wire [AXIS_DATA_WIDTH/32-1:0] s_axis_tkeep_0,   // PG343: tkeep is per-DWORD
     input  wire                          s_axis_tvalid_0,
     input  wire                          s_axis_tlast_0,
     input  wire [AXIS_TUSER_WIDTH-1:0]   s_axis_tuser_0,
@@ -49,7 +49,7 @@ module axi4_mwr_batch_top #(
 
     // -------- Slave input port 1 (RQ) --------
     input  wire [AXIS_DATA_WIDTH-1:0]    s_axis_tdata_1,
-    input  wire [AXIS_DATA_WIDTH/8-1:0]  s_axis_tkeep_1,
+    input  wire [AXIS_DATA_WIDTH/32-1:0] s_axis_tkeep_1,   // PG343: tkeep is per-DWORD
     input  wire                          s_axis_tvalid_1,
     input  wire                          s_axis_tlast_1,
     input  wire [AXIS_TUSER_WIDTH-1:0]   s_axis_tuser_1,
@@ -57,7 +57,7 @@ module axi4_mwr_batch_top #(
 
     // -------- Master output (RQ, batched) --------
     output wire [AXIS_DATA_WIDTH-1:0]    m_axis_tdata,
-    output wire [AXIS_DATA_WIDTH/8-1:0]  m_axis_tkeep,
+    output wire [AXIS_DATA_WIDTH/32-1:0] m_axis_tkeep,    // PG343: tkeep is per-DWORD
     output wire                          m_axis_tvalid,
     output wire                          m_axis_tlast,
     output wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser,
@@ -68,7 +68,7 @@ module axi4_mwr_batch_top #(
     // Telemetry -> Batcher interconnect (one set per input port)
     // =============================================================
     wire [AXIS_DATA_WIDTH-1:0]    tel0_tdata,  tel1_tdata;
-    wire [AXIS_DATA_WIDTH/8-1:0]  tel0_tkeep,  tel1_tkeep;
+    wire [AXIS_DATA_WIDTH/32-1:0] tel0_tkeep,  tel1_tkeep;   // PG343: tkeep is per-DWORD
     wire                          tel0_tvalid, tel1_tvalid;
     wire                          tel0_tlast,  tel1_tlast;
     wire [AXIS_TUSER_WIDTH-1:0]   tel0_tuser,  tel1_tuser;
