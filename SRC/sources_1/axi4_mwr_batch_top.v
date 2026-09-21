@@ -26,6 +26,8 @@ module axi4_mwr_batch_top #(
     parameter integer FIFO_DEPTH       = 128,
     parameter integer TIME_FEDILITY    = 8,
     parameter integer DEPTH_FEDILITY   = 8,
+    parameter integer MAX_PKT_BEATS    = 16,            // assumed worst-case packet length, in beats
+    parameter integer MRD_DEDICATED_FIFO = 0,           // 1 = batched MRd gets its own FIFO 3/4
     // --- Telemetry (axi4_telemetry) ---
     parameter integer TELEMETRY_DEPTH  = 512,
     parameter integer DATA_FIDELITY    = 8,
@@ -35,9 +37,12 @@ module axi4_mwr_batch_top #(
     input  wire                          clk,
     input  wire                          rst_n,
 
-    // Batching-priority thresholds (forwarded to axi4_mwr_batch)
+    // Batching-priority thresholds (forwarded to axi4_mwr_batch).
+    // depth_threshold counts whole PACKETS resident in a batching FIFO, not beats.
     input  wire [TIME_FEDILITY-1:0]      time_threshold,
     input  wire [DEPTH_FEDILITY-1:0]     depth_threshold,
+    // Runtime enable for MRd batching (forwarded to axi4_mwr_batch).
+    input  wire                          batch_mrd,
 
     // -------- Slave input port 0 (RQ) --------
     input  wire [AXIS_DATA_WIDTH-1:0]    s_axis_tdata_0,
@@ -143,12 +148,15 @@ module axi4_mwr_batch_top #(
         .FIFO_DEPTH       (FIFO_DEPTH),
         .TIME_FEDILITY    (TIME_FEDILITY),
         .DEPTH_FEDILITY   (DEPTH_FEDILITY),
+        .MAX_PKT_BEATS    (MAX_PKT_BEATS),
+        .MRD_DEDICATED_FIFO (MRD_DEDICATED_FIFO),
         .IF_TYPE          ("RQ")
     ) u_mwr_batch (
         .clk             (clk),
         .rst_n           (rst_n),
         .time_threshold  (time_threshold),
         .depth_threshold (depth_threshold),
+        .batch_mrd       (batch_mrd),
         // slave 0 <- telemetry 0
         .s_axis_tdata_0  (tel0_tdata),
         .s_axis_tkeep_0  (tel0_tkeep),

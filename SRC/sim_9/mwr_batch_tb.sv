@@ -17,6 +17,7 @@ reg                           rst_n;
 
 reg  [TIME_FEDILITY-1:0]      time_threshold;
 reg  [DEPTH_FEDILITY-1:0]     depth_threshold;
+reg                           batch_mrd;
 
 reg  [AXIS_DATA_WIDTH-1:0]    s_axis_tdata_0;
 reg  [AXIS_DATA_WIDTH/32-1:0] s_axis_tkeep_0;   // PG343: tkeep is per-DWORD
@@ -47,6 +48,7 @@ axi4_mwr_batch dut (
 	.rst_n                 (rst_n),
 	.time_threshold        (time_threshold),
 	.depth_threshold       (depth_threshold),
+	.batch_mrd             (batch_mrd),
 
 	.s_axis_tdata_0        (s_axis_tdata_0),
 	.s_axis_tkeep_0        (s_axis_tkeep_0),
@@ -80,7 +82,13 @@ task automatic reset_dut;
 begin
 	rst_n          = 1'b0;
 	time_threshold = 8'd6;
-	depth_threshold= 8'd10;
+	// depth_threshold is PER-PACKET (complete packets resident in a batching
+	// FIFO), not per-beat.  With 1..12-beat packets, 10 beats used to be ~1
+	// packet; 4 packets keeps the depth trigger reachable under this stimulus.
+	depth_threshold= 8'd4;
+	// MRd batching off by default here, so MRd keeps taking the FIFO-2
+	// pass-through path this testbench's checks were written against.
+	batch_mrd      = 1'b0;
 
 	s_axis_tdata_0 = '0;
 	s_axis_tkeep_0 = '0;
