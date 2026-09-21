@@ -23,11 +23,20 @@
 //   REG_INIT             flattened {NUM_REGS x DATA_WIDTH} reset values
 //
 // All four are written as hex literals.  The masks are one bit per register,
-// widened to a whole number of bytes (MASK_W = ceil(NUM_REGS/8)*8) so the hex
-// digits always line up - 2 digits per byte - whatever NUM_REGS happens to be;
-// mask bits above NUM_REGS-1 are padding and are ignored.  REG_INIT is one
-// DATA_WIDTH field per register with register 0 in the least significant
-// position, so the literal reads {regN-1, ..., reg1, reg0} left to right.
+// widened to a whole number of bytes - ceil(NUM_REGS/8)*8 - so the hex digits
+// always line up at 2 per byte whatever NUM_REGS happens to be; mask bits
+// above NUM_REGS-1 are padding and are ignored.  REG_INIT is one DATA_WIDTH
+// field per register with register 0 in the least significant position, so
+// the literal reads {regN-1, ..., reg1, reg0} left to right.
+//
+// Every name in the parameter list is a real, independent knob - there are no
+// derived parameters, because IP Integrator drives all of them and would push
+// back a value frozen at package time rather than one tracking NUM_REGS.  The
+// two width expressions are therefore written out inline in the parameter
+// list and repeated once as localparams (MASK_W / INIT_W) for internal use.
+//
+// Defaults describe the smallest useful instance: a single read/write
+// register at offset 0x00 that resets to 0x0000_0001, in a 4 KB aperture.
 //
 // Registers are mapped densely starting at offset 0, one register per
 // DATA_WIDTH/8 bytes: register i lives at byte offset i*(DATA_WIDTH/8).
@@ -37,11 +46,12 @@
 // slice them as  hw_status[i*DATA_WIDTH +: DATA_WIDTH].
 //
 // Example - 4 registers: 0 = RW control (reset 0x0000_0001), 1 = RW threshold
-// (reset 0x80), 2 = RO status, 3 = W1C error flags.  MASK_W = 8, INIT_W = 128:
+// (reset 0x80), 2 = RO status, 3 = W1C error flags.  4 registers gives a mask
+// width of 8 and a REG_INIT width of 128:
 //
 //   axil4_regfile #(
 //       .NUM_REGS            (4),
-//       .C_S_AXI_ADDR_WIDTH  (4),
+//       .C_S_AXI_ADDR_WIDTH  (12),
 //       .REG_RW_MASK         (8'h03),   // regs 1, 0
 //       .REG_W1C_MASK        (8'h08),   // reg 3
 //       .REG_SELF_CLEAR_MASK (8'h00),
@@ -72,24 +82,24 @@
 
 module axil4_regfile #(
     parameter integer C_S_AXI_DATA_WIDTH = 32,   // 32 or 64
-    parameter integer C_S_AXI_ADDR_WIDTH = 6,    // must cover NUM_REGS*(DATA_WIDTH/8) bytes
-    parameter integer NUM_REGS           = 16,
-
-    // ---- Derived widths - DO NOT OVERRIDE ---------------------------------
-    // MASK_W rounds NUM_REGS up to a whole byte so every mask is a tidy hex
-    // literal (2 hex digits per byte).  Bits above NUM_REGS-1 are padding.
-    parameter integer MASK_W = ((NUM_REGS + 7) / 8) * 8,
-    parameter integer INIT_W = NUM_REGS * C_S_AXI_DATA_WIDTH,
+    parameter integer C_S_AXI_ADDR_WIDTH = 12,   // must cover NUM_REGS*(DATA_WIDTH/8) bytes
+    parameter integer NUM_REGS           = 1,
 
     // ---- Per-register type masks, hex: bit i describes register i ---------
-    parameter [MASK_W-1:0] REG_RW_MASK         = {MASK_W{1'b1}},
-    parameter [MASK_W-1:0] REG_W1C_MASK        = {MASK_W{1'b0}},
-    parameter [MASK_W-1:0] REG_SELF_CLEAR_MASK = {MASK_W{1'b0}},
+    // Width is NUM_REGS rounded up to a whole byte, so a mask is always a tidy
+    // hex literal (2 digits per byte).  The rounding expression is spelled out
+    // inline on purpose: IP Integrator drives every name in this parameter
+    // list, so a "derived" parameter would be overridden with a value frozen
+    // at package time instead of tracking whatever NUM_REGS is set to.  The
+    // same expressions appear once more as localparams inside the module.
+    parameter [(((NUM_REGS+7)/8)*8)-1:0] REG_RW_MASK         = 8'h01,
+    parameter [(((NUM_REGS+7)/8)*8)-1:0] REG_W1C_MASK        = 8'h00,
+    parameter [(((NUM_REGS+7)/8)*8)-1:0] REG_SELF_CLEAR_MASK = 8'h00,
 
     // ---- Reset values, hex: one DATA_WIDTH field per register -------------
     // Register i occupies REG_INIT[i*DATA_WIDTH +: DATA_WIDTH], so register 0
     // is the least significant field: {regN-1, ..., reg1, reg0}.
-    parameter [INIT_W-1:0] REG_INIT = {INIT_W{1'b0}},
+    parameter [(NUM_REGS*C_S_AXI_DATA_WIDTH)-1:0] REG_INIT = 32'h0000_0001,
 
     // 1 = unmapped address returns DECERR, 0 = returns OKAY (reads return 0)
     parameter integer DECODE_ERR_EN = 1,
@@ -179,16 +189,31 @@ localparam integer ADDR_LSB  = (DW == 64) ? 3 : 2;        // byte-offset bits
 localparam integer IDX_W     = (NUM_REGS > 1) ? $clog2(NUM_REGS) : 1;
 localparam integer MAP_BYTES = NUM_REGS * SW;             // size of the aperture
 
+// Widths of the hex parameters above.  These localparams are the module's
+// internal definition of those widths - the parameter list has to repeat the
+// expressions inline because anything declared there is overridable from IP
+// Integrator, and nothing below may depend on such a value being correct.
+localparam integer MASK_W = ((NUM_REGS + 7) / 8) * 8;
+localparam integer INIT_W = NUM_REGS * C_S_AXI_DATA_WIDTH;
+
 // Internal address width: at least 32 bits so the single range comparison
 // below never truncates, and never narrower than the port itself.
 localparam integer AW_X = (AW > 32) ? AW : 32;
+
+// Width-explicit local copies of the hex parameters.  Re-stating the widths
+// here means nothing downstream depends on how wide a literal the caller (or
+// IP Integrator) happened to pass in - a short literal zero-extends, an
+// over-wide one truncates, and either way the slices below are well defined.
+localparam [MASK_W-1:0] RW_MASK   = REG_RW_MASK;
+localparam [MASK_W-1:0] W1C_MASK  = REG_W1C_MASK;
+localparam [MASK_W-1:0] SC_MASK   = REG_SELF_CLEAR_MASK;
+localparam [INIT_W-1:0] INIT_VALS = REG_INIT;
 
 // A register has flip-flops behind it if it is software-writable, W1C, or
 // self-clearing.  Everything else is a pure read-only window onto hw_status.
 // Declaring this NUM_REGS wide (not MASK_W) drops the byte-alignment padding
 // from the mask parameters, so it stays width-matched with the decodes below.
-localparam [NUM_REGS-1:0] STORAGE_MASK =
-           REG_RW_MASK | REG_W1C_MASK | REG_SELF_CLEAR_MASK;
+localparam [NUM_REGS-1:0] STORAGE_MASK = RW_MASK | W1C_MASK | SC_MASK;
 
 localparam [1:0] RESP_OKAY   = 2'b00;
 localparam [1:0] RESP_SLVERR = 2'b10;
@@ -296,7 +321,7 @@ genvar gi;
 generate
 for (gi = 0; gi < NUM_REGS; gi = gi + 1) begin : g_reg
 
-    localparam [DW-1:0] INIT_I = REG_INIT[gi*DW +: DW];
+    localparam [DW-1:0] INIT_I = INIT_VALS[gi*DW +: DW];
 
     assign wr_dec[gi] = (wr_index == gi[IDX_W-1:0]);
     assign rd_dec[gi] = (rd_index == gi[IDX_W-1:0]);
@@ -312,14 +337,14 @@ for (gi = 0; gi < NUM_REGS; gi = gi + 1) begin : g_reg
         always @(posedge s_axi_aclk) begin
             if (!s_axi_aresetn) begin
                 r <= INIT_I;
-            end else if (REG_W1C_MASK[gi]) begin
+            end else if (W1C_MASK[gi]) begin
                 // Sticky status: a hardware set wins over a simultaneous
                 // software clear, so an event arriving during the clearing
                 // write is never lost.
                 r <= (r & ~w1c_clr) | set_i;
             end else if (wr_sel[gi]) begin
                 r <= (r & ~wr_bitmask) | (wr_data & wr_bitmask);
-            end else if (REG_SELF_CLEAR_MASK[gi]) begin
+            end else if (SC_MASK[gi]) begin
                 // Command register: the written value is visible for exactly
                 // one clock, then snaps back to its reset value.
                 r <= INIT_I;
