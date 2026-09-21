@@ -22,6 +22,13 @@
 //                            strobe registers).  Implies storage.
 //   REG_INIT             flattened {NUM_REGS x DATA_WIDTH} reset values
 //
+// All four are written as hex literals.  The masks are one bit per register,
+// widened to a whole number of bytes (MASK_W = ceil(NUM_REGS/8)*8) so the hex
+// digits always line up - 2 digits per byte - whatever NUM_REGS happens to be;
+// mask bits above NUM_REGS-1 are padding and are ignored.  REG_INIT is one
+// DATA_WIDTH field per register with register 0 in the least significant
+// position, so the literal reads {regN-1, ..., reg1, reg0} left to right.
+//
 // Registers are mapped densely starting at offset 0, one register per
 // DATA_WIDTH/8 bytes: register i lives at byte offset i*(DATA_WIDTH/8).
 // Accesses past the last register return DECERR (see DECODE_ERR_EN).
@@ -30,16 +37,16 @@
 // slice them as  hw_status[i*DATA_WIDTH +: DATA_WIDTH].
 //
 // Example - 4 registers: 0 = RW control (reset 0x0000_0001), 1 = RW threshold
-// (reset 0x80), 2 = RO status, 3 = W1C error flags:
+// (reset 0x80), 2 = RO status, 3 = W1C error flags.  MASK_W = 8, INIT_W = 128:
 //
 //   axil4_regfile #(
 //       .NUM_REGS            (4),
 //       .C_S_AXI_ADDR_WIDTH  (4),
-//       .REG_RW_MASK         (4'b0011),
-//       .REG_W1C_MASK        (4'b1000),
-//       .REG_SELF_CLEAR_MASK (4'b0000),
-//       .REG_INIT            ({32'h0, 32'h0, 32'h0000_0080, 32'h0000_0001})
-//   ) u_regs ( ... );
+//       .REG_RW_MASK         (8'h03),   // regs 1, 0
+//       .REG_W1C_MASK        (8'h08),   // reg 3
+//       .REG_SELF_CLEAR_MASK (8'h00),
+//       .REG_INIT            (128'h00000000_00000000_00000080_00000001)
+//   ) u_regs ( ... );      //   reg3     reg2     reg1     reg0
 //
 // Protocol notes:
 //   * AW and W are accepted independently and may arrive in either order; the
@@ -68,14 +75,21 @@ module axil4_regfile #(
     parameter integer C_S_AXI_ADDR_WIDTH = 6,    // must cover NUM_REGS*(DATA_WIDTH/8) bytes
     parameter integer NUM_REGS           = 16,
 
-    // Per-register type masks (bit i describes register i)
-    parameter [NUM_REGS-1:0] REG_RW_MASK         = {NUM_REGS{1'b1}},
-    parameter [NUM_REGS-1:0] REG_W1C_MASK        = {NUM_REGS{1'b0}},
-    parameter [NUM_REGS-1:0] REG_SELF_CLEAR_MASK = {NUM_REGS{1'b0}},
+    // ---- Derived widths - DO NOT OVERRIDE ---------------------------------
+    // MASK_W rounds NUM_REGS up to a whole byte so every mask is a tidy hex
+    // literal (2 hex digits per byte).  Bits above NUM_REGS-1 are padding.
+    parameter integer MASK_W = ((NUM_REGS + 7) / 8) * 8,
+    parameter integer INIT_W = NUM_REGS * C_S_AXI_DATA_WIDTH,
 
-    // Flattened reset values: register i = REG_INIT[i*DATA_WIDTH +: DATA_WIDTH]
-    parameter [NUM_REGS*C_S_AXI_DATA_WIDTH-1:0] REG_INIT =
-              {(NUM_REGS*C_S_AXI_DATA_WIDTH){1'b0}},
+    // ---- Per-register type masks, hex: bit i describes register i ---------
+    parameter [MASK_W-1:0] REG_RW_MASK         = {MASK_W{1'b1}},
+    parameter [MASK_W-1:0] REG_W1C_MASK        = {MASK_W{1'b0}},
+    parameter [MASK_W-1:0] REG_SELF_CLEAR_MASK = {MASK_W{1'b0}},
+
+    // ---- Reset values, hex: one DATA_WIDTH field per register -------------
+    // Register i occupies REG_INIT[i*DATA_WIDTH +: DATA_WIDTH], so register 0
+    // is the least significant field: {regN-1, ..., reg1, reg0}.
+    parameter [INIT_W-1:0] REG_INIT = {INIT_W{1'b0}},
 
     // 1 = unmapped address returns DECERR, 0 = returns OKAY (reads return 0)
     parameter integer DECODE_ERR_EN = 1,
@@ -171,6 +185,8 @@ localparam integer AW_X = (AW > 32) ? AW : 32;
 
 // A register has flip-flops behind it if it is software-writable, W1C, or
 // self-clearing.  Everything else is a pure read-only window onto hw_status.
+// Declaring this NUM_REGS wide (not MASK_W) drops the byte-alignment padding
+// from the mask parameters, so it stays width-matched with the decodes below.
 localparam [NUM_REGS-1:0] STORAGE_MASK =
            REG_RW_MASK | REG_W1C_MASK | REG_SELF_CLEAR_MASK;
 

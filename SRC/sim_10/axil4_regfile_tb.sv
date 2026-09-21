@@ -50,11 +50,12 @@ axil4_regfile #(
     .C_S_AXI_DATA_WIDTH  (DW),
     .C_S_AXI_ADDR_WIDTH  (AW),
     .NUM_REGS            (NR),
-    .REG_RW_MASK         (6'b100011),
-    .REG_W1C_MASK        (6'b001000),
-    .REG_SELF_CLEAR_MASK (6'b010000),
-    .REG_INIT            ({32'hDEAD_BEEF, 32'h0000_0000, 32'h0000_0000,
-                           32'h0000_0000, 32'h0000_0080, 32'h0000_0001}),
+    // NUM_REGS = 6 -> MASK_W = 8, INIT_W = 192
+    .REG_RW_MASK         (8'h23),        // regs 5, 1, 0
+    .REG_W1C_MASK        (8'h08),        // reg 3
+    .REG_SELF_CLEAR_MASK (8'h10),        // reg 4
+    //                      reg5     reg4     reg3     reg2     reg1     reg0
+    .REG_INIT            (192'hDEADBEEF_00000000_00000000_00000000_00000080_00000001),
     .DECODE_ERR_EN       (1),
     .RO_WR_ERR_EN        (1)
 ) dut (
