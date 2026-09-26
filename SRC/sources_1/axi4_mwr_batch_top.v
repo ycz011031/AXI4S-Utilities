@@ -15,9 +15,12 @@
 //   - AXIS_TUSER_WIDTH = 137 (RQ non-PASID tuser width, PG343 §3.1/§3.2)
 //
 // axi4_telemetry is a transparent passthrough that snoops each input
-// stream and buffers per-packet telemetry (length, gap, type, address,
-// tag, counts) for capture by its internal ILA; it does not alter the
-// data path feeding the batcher.
+// stream and records per-packet telemetry (length, gap, type, address,
+// tag); it does not alter the data path feeding the batcher.  With
+// DMA_LOG = 0 the records are played back into an internal ILA; with
+// DMA_LOG = 1 each port streams its records on m_axis_log_<n>_* to an
+// external AXI DMA (S2MM), both ports armed by the shared log_enable.
+// Record format: telemetry_dma_format.md.
 // =================================================================
 module axi4_mwr_batch_top #(
     parameter integer AXIS_DATA_WIDTH  = 512,
@@ -32,7 +35,10 @@ module axi4_mwr_batch_top #(
     parameter integer TELEMETRY_DEPTH  = 512,
     parameter integer DATA_FIDELITY    = 8,
     parameter integer ILA_DEPTH        = 0,
-    parameter         ENABLE_ILA       = 1              // per-port ILA in each telemetry block
+    parameter         ENABLE_ILA       = 1,             // per-port ILA in each telemetry block (DMA_LOG = 0)
+    parameter         DMA_LOG          = 0,             // 1 = log records to DDR via external AXI DMA
+    parameter integer DMA_REGION_BYTES = 1048576,       // per-port DDR region size, bytes
+    parameter integer LOG_TDATA_WIDTH  = 128            // m_axis_log_<n> tdata width
 )(
     input  wire                          clk,
     input  wire                          rst_n,
@@ -66,7 +72,30 @@ module axi4_mwr_batch_top #(
     output wire                          m_axis_tvalid,
     output wire                          m_axis_tlast,
     output wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser,
-    input  wire                          m_axis_tready
+    input  wire                          m_axis_tready,
+
+    // -------- Telemetry DMA logging (DMA_LOG = 1) --------
+    input  wire                          log_enable,       // rising edge arms both ports
+
+    output wire                          log_busy_0,
+    output wire                          log_done_0,
+    output wire                          log_overflow_0,
+    output wire [31:0]                   log_drop_count_0,
+    output wire [LOG_TDATA_WIDTH-1:0]    m_axis_log_0_tdata,
+    output wire [LOG_TDATA_WIDTH/8-1:0]  m_axis_log_0_tkeep,
+    output wire                          m_axis_log_0_tvalid,
+    output wire                          m_axis_log_0_tlast,
+    input  wire                          m_axis_log_0_tready,
+
+    output wire                          log_busy_1,
+    output wire                          log_done_1,
+    output wire                          log_overflow_1,
+    output wire [31:0]                   log_drop_count_1,
+    output wire [LOG_TDATA_WIDTH-1:0]    m_axis_log_1_tdata,
+    output wire [LOG_TDATA_WIDTH/8-1:0]  m_axis_log_1_tkeep,
+    output wire                          m_axis_log_1_tvalid,
+    output wire                          m_axis_log_1_tlast,
+    input  wire                          m_axis_log_1_tready
 );
 
     // =============================================================
@@ -89,7 +118,10 @@ module axi4_mwr_batch_top #(
         .DATA_FIDELITY    (DATA_FIDELITY),
         .ILA_DEPTH        (ILA_DEPTH),
         .ENABLE_ILA       (ENABLE_ILA),
-        .IF_TYPE          ("RQ")
+        .IF_TYPE          ("RQ"),
+        .DMA_LOG          (DMA_LOG),
+        .DMA_REGION_BYTES (DMA_REGION_BYTES),
+        .LOG_TDATA_WIDTH  (LOG_TDATA_WIDTH)
     ) u_telemetry_0 (
         .clk           (clk),
         .rst_n         (rst_n),
@@ -106,7 +138,18 @@ module axi4_mwr_batch_top #(
         .m_axis_tvalid (tel0_tvalid),
         .m_axis_tlast  (tel0_tlast),
         .m_axis_tuser  (tel0_tuser),
-        .m_axis_tready (tel0_tready)
+        .m_axis_tready (tel0_tready),
+        // DMA log
+        .log_enable        (log_enable),
+        .log_busy          (log_busy_0),
+        .log_done          (log_done_0),
+        .log_overflow      (log_overflow_0),
+        .log_drop_count    (log_drop_count_0),
+        .m_axis_log_tdata  (m_axis_log_0_tdata),
+        .m_axis_log_tkeep  (m_axis_log_0_tkeep),
+        .m_axis_log_tvalid (m_axis_log_0_tvalid),
+        .m_axis_log_tlast  (m_axis_log_0_tlast),
+        .m_axis_log_tready (m_axis_log_0_tready)
     );
 
     // =============================================================
@@ -119,7 +162,10 @@ module axi4_mwr_batch_top #(
         .DATA_FIDELITY    (DATA_FIDELITY),
         .ILA_DEPTH        (ILA_DEPTH),
         .ENABLE_ILA       (ENABLE_ILA),
-        .IF_TYPE          ("RQ")
+        .IF_TYPE          ("RQ"),
+        .DMA_LOG          (DMA_LOG),
+        .DMA_REGION_BYTES (DMA_REGION_BYTES),
+        .LOG_TDATA_WIDTH  (LOG_TDATA_WIDTH)
     ) u_telemetry_1 (
         .clk           (clk),
         .rst_n         (rst_n),
@@ -136,7 +182,18 @@ module axi4_mwr_batch_top #(
         .m_axis_tvalid (tel1_tvalid),
         .m_axis_tlast  (tel1_tlast),
         .m_axis_tuser  (tel1_tuser),
-        .m_axis_tready (tel1_tready)
+        .m_axis_tready (tel1_tready),
+        // DMA log
+        .log_enable        (log_enable),
+        .log_busy          (log_busy_1),
+        .log_done          (log_done_1),
+        .log_overflow      (log_overflow_1),
+        .log_drop_count    (log_drop_count_1),
+        .m_axis_log_tdata  (m_axis_log_1_tdata),
+        .m_axis_log_tkeep  (m_axis_log_1_tkeep),
+        .m_axis_log_tvalid (m_axis_log_1_tvalid),
+        .m_axis_log_tlast  (m_axis_log_1_tlast),
+        .m_axis_log_tready (m_axis_log_1_tready)
     );
 
     // =============================================================

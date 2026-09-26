@@ -5,7 +5,17 @@ module axi4_telemetry #(
     parameter integer DATA_FIDELITY    = 8,    // Max value bits for length/gap counters (default 8 = max 255)
     parameter integer ILA_DEPTH        = 0,    // ILA sample depth (0 = auto-set to STREAM_DURATION)
     parameter         ENABLE_ILA       = 1,    // 1 = Enable ILA instantiation (requires ila_0 IP), 0 = Disable
-    parameter         IF_TYPE          = "CQ"  // "CQ" or "RQ" — selects tuser sideband bit layout (PG343)
+    parameter         IF_TYPE          = "CQ", // "CQ" or "RQ" — selects tuser sideband bit layout (PG343)
+
+    // --- DMA logging mode (see telemetry_dma_format.md) ---
+    // 0 = legacy ILA mode: BRAM ring + cyclic playback into ila_0.
+    // 1 = DMA mode: one 16-byte record per TLP is streamed on m_axis_log_* into
+    //     an external AXI DMA (S2MM, simple mode).  The ILA and the playback ring
+    //     are not built; TELEMETRY_DEPTH becomes the depth of the record FIFO that
+    //     absorbs DMA backpressure (power of two, >= 16).
+    parameter         DMA_LOG          = 0,
+    parameter integer DMA_REGION_BYTES = 1048576, // DDR region size, bytes; multiple of LOG_TDATA_WIDTH/8
+    parameter integer LOG_TDATA_WIDTH  = 128      // m_axis_log tdata width: 128, 256, 512 or 1024
 )(
     input wire                          clk,
     input wire                          rst_n,
@@ -24,7 +34,24 @@ module axi4_telemetry #(
     output wire                          m_axis_tvalid,
     output wire                          m_axis_tlast,
     output wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser,
-    input  wire                          m_axis_tready
+    input  wire                          m_axis_tready,
+
+    // DMA logging control / status (DMA_LOG = 1; inert when DMA_LOG = 0).
+    // A recording starts on a RISING EDGE of log_enable while idle and ends when
+    // the region is full or log_enable goes low.  log_enable is synchronised
+    // internally, so it may come from another clock domain.
+    input  wire                          log_enable,
+    output wire                          log_busy,       // recording or draining to the DMA
+    output wire                          log_done,       // last recording closed (tlast sent); cleared on re-arm
+    output wire                          log_overflow,   // >=1 record dropped in the last/current recording
+    output wire [31:0]                   log_drop_count, // records dropped (written as zero records)
+
+    // AXI4-Stream master to the AXI DMA S2MM slave (DMA_LOG = 1)
+    output wire [LOG_TDATA_WIDTH-1:0]    m_axis_log_tdata,
+    output wire [LOG_TDATA_WIDTH/8-1:0]  m_axis_log_tkeep,
+    output wire                          m_axis_log_tvalid,
+    output wire                          m_axis_log_tlast,
+    input  wire                          m_axis_log_tready
 );
 
 // =================================================================
@@ -211,9 +238,13 @@ reg [DATA_FIDELITY-1:0]  tel_other_count;    // Other packet types in this buffe
 
 // =================================================================
 // Block RAM Instantiation (XPM)
-// Single dual-port BRAM for better routing and timing
+// Single dual-port BRAM for better routing and timing.
+// Built in ILA mode only; in DMA mode the playback FSM below is left
+// dangling (reads zeros, drives nothing) and is trimmed by synthesis.
 // =================================================================
 
+generate
+if (DMA_LOG == 0) begin : gen_ring_bram
 xpm_memory_sdpram #(
     .ADDR_WIDTH_A(ADDR_WIDTH),
     .ADDR_WIDTH_B(ADDR_WIDTH),
@@ -259,6 +290,10 @@ xpm_memory_sdpram #(
     .dbiterrb(),
     .sbiterrb()
 );
+end else begin : gen_no_ring_bram
+    assign mem_doutb = {TEL_ENTRY_WIDTH{1'b0}};
+end
+endgenerate
 
 // BRAM write port control
 reg                     r_mem_wea;
@@ -302,6 +337,20 @@ wire [61:0] eff_pkt_addr = is_sop ? address_full : r_cur_pkt_addr;
 wire [7:0]  eff_pkt_tag  = is_sop ? tag          : r_cur_pkt_tag;
 wire [1:0]  eff_addr_typ = is_sop ? address_type : r_cur_addr_type;
 wire [10:0] eff_dw_count = is_sop ? dword_count  : r_cur_dword_count;
+
+// Per-packet values recorded at EOP (shared by the ILA ring and the DMA log).
+// Beat count: include the EOP beat itself (+1), except for single-beat
+// packets where is_sop fires on the same cycle (store 1 directly).
+// Payload in DWORDs: dword_count for MWr (clamped), 0 for all other types.
+wire [DATA_FIDELITY-1:0] eop_pkt_length =
+    is_sop ? {{(DATA_FIDELITY-1){1'b0}}, 1'b1}
+           : (r_beat_count < {DATA_FIDELITY{1'b1}} ? r_beat_count + 1'b1
+                                                    : {DATA_FIDELITY{1'b1}});
+wire [DATA_FIDELITY-1:0] eop_payload_dw =
+    (eff_pkt_type == MWR_TYPE) ?
+        ((eff_dw_count[10:0] > {{(11-DATA_FIDELITY){1'b0}}, {DATA_FIDELITY{1'b1}}}) ?
+            {DATA_FIDELITY{1'b1}} : eff_dw_count[DATA_FIDELITY-1:0]) :
+        {DATA_FIDELITY{1'b0}};
 
 // =================================================================
 // Packet Collection Process
@@ -367,22 +416,14 @@ always @(posedge clk or negedge rst_n) begin
         // ----------------------------------------------------------
         if (is_eop) begin
             // Pack all fields into single BRAM write
-            // Calculate payload in DWORDs inline (for MWr, use dword_count; others = 0)
-            // Beat count: include the EOP beat itself (+1), except for single-beat
-            // packets where is_sop fires on the same cycle (store 1 directly).
             r_mem_dina <= {
                 eff_addr_typ,         // [99:98]
                 eff_pkt_tag,          // [97:90]
-                (eff_pkt_type == MWR_TYPE) ?  // [89:82] payload_dw
-                    ((eff_dw_count[10:0] > {{(11-DATA_FIDELITY){1'b0}}, {DATA_FIDELITY{1'b1}}}) ?
-                        {DATA_FIDELITY{1'b1}} : eff_dw_count[DATA_FIDELITY-1:0]) :
-                    {DATA_FIDELITY{1'b0}},
+                eop_payload_dw,       // [89:82]
                 eff_pkt_addr,         // [81:20]
                 eff_pkt_type,         // [19:16]
                 r_gap_count,          // [15:8]
-                is_sop ? {{(DATA_FIDELITY-1){1'b0}}, 1'b1}  // single-beat packet
-                       : (r_beat_count < {DATA_FIDELITY{1'b1}} ? r_beat_count + 1'b1
-                                                                 : {DATA_FIDELITY{1'b1}})  // [7:0]
+                eop_pkt_length        // [7:0]
             };
             r_mem_addra <= r_write_ptr;
             r_mem_wea   <= 1'b1;  // Write enable
@@ -593,6 +634,359 @@ always @(posedge clk or negedge rst_n) begin
 end
 
 // =================================================================
+// DMA Logging Path (DMA_LOG = 1)
+//
+// Writes one 16-byte record per TLP into a single DDR region through an
+// external AXI DMA (S2MM).  Record layout: telemetry_dma_format.md.
+//
+//   EOP -> event reg -> xpm_fifo_sync -> zero expander -> beat packer -> m_axis_log
+//
+// Recording control (one-shot, edge-armed):
+//   IDLE  : wait for a rising edge of log_enable (edges seen in any other state
+//           are ignored, so re-arming needs log_enable to go low and high again).
+//   REC   : every EOP claims one region slot.  If the FIFO is full the record
+//           is dropped, but its slot is still claimed and it is later emitted
+//           as an all-zero record, so every TLP keeps its position in DDR.
+//   FINAL : write the closing FIFO entry: zeros still owed for drops, plus -
+//           on an enable-low stop - one zero terminator record and zero padding
+//           up to a whole beat.
+//   DRAIN : wait for the tlast beat to be accepted by the DMA, then back to IDLE.
+//
+// The stream never exceeds DMA_REGION_BYTES, and tlast is on its last beat, so
+// the DMA closes the transfer and nothing already in DDR is overwritten.
+//
+// FIFO entry = {last, zcnt, rec_valid, rec[111:0]}: emit zcnt zero records,
+// then rec (if rec_valid).  'last' marks the entry whose final record carries
+// tlast.  Carrying the owed-zero count in the entry keeps dropped records in
+// their original position without needing a FIFO write per dropped record.
+// =================================================================
+localparam integer LOG_REC_BITS      = 128;
+localparam integer LOG_REC_BYTES     = LOG_REC_BITS / 8;
+localparam integer LOG_DATA_BITS     = 112;                                 // 14 data bytes + 2 pad
+localparam integer LOG_RECS_PER_BEAT = LOG_TDATA_WIDTH / LOG_REC_BITS;      // records per AXIS beat
+localparam integer LOG_REGION_RECS   = DMA_REGION_BYTES / LOG_REC_BYTES;    // record slots in region
+localparam integer LOG_CNT_WIDTH     = $clog2(LOG_REGION_RECS + 1);
+localparam integer LOG_BEAT_IDX_W    = (LOG_RECS_PER_BEAT > 1) ? $clog2(LOG_RECS_PER_BEAT) : 1;
+localparam integer LOG_FIFO_WIDTH    = 1 + LOG_CNT_WIDTH + 1 + LOG_DATA_BITS;
+
+// Record data bytes 0..13, little-endian (byte 0 = tdata[7:0]).
+// Byte-sized fields assume DATA_FIDELITY == 8 (as does the ILA ring layout).
+wire [LOG_DATA_BITS-1:0] log_rec_data = {
+    {6'd0, eff_addr_typ},     // byte  13      addr_type
+    eff_pkt_tag,              // byte  12      pkt_tag
+    eop_payload_dw,           // byte  11      payload_dw
+    {4'd0, eff_pkt_type},     // byte  10      pkt_type
+    r_gap_count,              // byte   9      pkt_gap
+    eop_pkt_length,           // byte   8      pkt_length
+    {eff_pkt_addr, 2'b00}     // bytes  7..0   pkt_addr (byte address)
+};
+
+generate
+if (DMA_LOG == 1) begin : gen_dma_log
+
+    // ------------------------------------------------------------
+    // log_enable synchroniser + edge detect
+    // ------------------------------------------------------------
+    (* ASYNC_REG = "TRUE" *) reg [1:0] r_en_sync;
+    reg                                r_en_prev;
+    wire en_s    = r_en_sync[1];
+    wire en_rise = en_s && !r_en_prev;
+
+    // ------------------------------------------------------------
+    // Record event register (breaks the tdata -> FIFO din path)
+    // ------------------------------------------------------------
+    reg                     r_ev_valid;
+    reg [LOG_DATA_BITS-1:0] r_ev_rec;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            r_en_sync  <= 2'b00;
+            r_en_prev  <= 1'b0;
+            r_ev_valid <= 1'b0;
+            r_ev_rec   <= {LOG_DATA_BITS{1'b0}};
+        end else begin
+            r_en_sync  <= {r_en_sync[0], log_enable};
+            r_en_prev  <= en_s;
+            r_ev_valid <= is_eop;
+            if (is_eop)
+                r_ev_rec <= log_rec_data;
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Record FIFO
+    // ------------------------------------------------------------
+    reg                       fifo_wr_en;
+    reg  [LOG_FIFO_WIDTH-1:0] fifo_din;
+    wire                      fifo_full;
+    wire                      fifo_wr_rst_busy;
+    wire                      fifo_rd_en;
+    wire [LOG_FIFO_WIDTH-1:0] fifo_dout;
+    wire                      fifo_empty;
+
+    wire fifo_no_room = fifo_full || fifo_wr_rst_busy;
+
+    xpm_fifo_sync #(
+        .DOUT_RESET_VALUE    ("0"),
+        .ECC_MODE            ("no_ecc"),
+        .FIFO_MEMORY_TYPE    ("auto"),
+        .FIFO_READ_LATENCY   (0),
+        .FIFO_WRITE_DEPTH    (TELEMETRY_DEPTH),
+        .FULL_RESET_VALUE    (0),
+        .PROG_EMPTY_THRESH   (10),
+        .PROG_FULL_THRESH    (10),
+        .RD_DATA_COUNT_WIDTH (1),
+        .READ_DATA_WIDTH     (LOG_FIFO_WIDTH),
+        .READ_MODE           ("fwft"),
+        .SIM_ASSERT_CHK      (0),
+        .USE_ADV_FEATURES    ("0000"),
+        .WAKEUP_TIME         (0),
+        .WRITE_DATA_WIDTH    (LOG_FIFO_WIDTH),
+        .WR_DATA_COUNT_WIDTH (1)
+    ) u_log_fifo (
+        .sleep         (1'b0),
+        .rst           (~rst_n),
+        .wr_clk        (clk),
+        .wr_en         (fifo_wr_en),
+        .din           (fifo_din),
+        .full          (fifo_full),
+        .prog_full     (),
+        .wr_data_count (),
+        .overflow      (),
+        .wr_rst_busy   (fifo_wr_rst_busy),
+        .almost_full   (),
+        .wr_ack        (),
+        .rd_en         (fifo_rd_en),
+        .dout          (fifo_dout),
+        .empty         (fifo_empty),
+        .prog_empty    (),
+        .rd_data_count (),
+        .underflow     (),
+        .rd_rst_busy   (),
+        .almost_empty  (),
+        .data_valid    (),
+        .injectsbiterr (1'b0),
+        .injectdbiterr (1'b0),
+        .sbiterr       (),
+        .dbiterr       ()
+    );
+
+    // ------------------------------------------------------------
+    // Recording control FSM (FIFO write side)
+    // ------------------------------------------------------------
+    localparam [1:0] LG_IDLE  = 2'd0;
+    localparam [1:0] LG_REC   = 2'd1;
+    localparam [1:0] LG_FINAL = 2'd2;
+    localparam [1:0] LG_DRAIN = 2'd3;
+
+    reg [1:0]               r_lg_state;
+    reg [LOG_CNT_WIDTH-1:0] r_slots;       // region slots claimed so far
+    reg [LOG_CNT_WIDTH-1:0] r_pending;     // dropped records not yet represented in the FIFO
+    reg [LOG_CNT_WIDTH-1:0] r_drop_cnt;    // records dropped in this recording
+    reg                     r_stop_full;   // recording ended because the region filled
+    reg                     r_done;
+    reg                     r_overflow;
+
+    wire rec_claim     = (r_lg_state == LG_REC) && r_ev_valid;
+    wire rec_last_slot = rec_claim && (r_slots == LOG_REGION_RECS - 1);
+    wire rec_fits      = rec_claim && !fifo_no_room;
+
+    // Zero records appended on an enable-low stop: one terminator plus padding
+    // to a whole beat (1..LOG_RECS_PER_BEAT).  None when the region filled.
+    wire [LOG_CNT_WIDTH-1:0] final_pad =
+        r_stop_full ? {LOG_CNT_WIDTH{1'b0}}
+                    : LOG_RECS_PER_BEAT - (r_slots % LOG_RECS_PER_BEAT);
+
+    wire log_tlast_fire;
+
+    always @(*) begin
+        fifo_wr_en = 1'b0;
+        fifo_din   = {LOG_FIFO_WIDTH{1'b0}};
+        if (rec_fits) begin
+            fifo_wr_en = 1'b1;
+            fifo_din   = {rec_last_slot, r_pending, 1'b1, r_ev_rec};
+        end else if (r_lg_state == LG_FINAL && !fifo_no_room) begin
+            fifo_wr_en = 1'b1;
+            fifo_din   = {1'b1, r_pending + final_pad, 1'b0, {LOG_DATA_BITS{1'b0}}};
+        end
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            r_lg_state  <= LG_IDLE;
+            r_slots     <= {LOG_CNT_WIDTH{1'b0}};
+            r_pending   <= {LOG_CNT_WIDTH{1'b0}};
+            r_drop_cnt  <= {LOG_CNT_WIDTH{1'b0}};
+            r_stop_full <= 1'b0;
+            r_done      <= 1'b0;
+            r_overflow  <= 1'b0;
+        end else begin
+            case (r_lg_state)
+                LG_IDLE: begin
+                    if (en_rise) begin
+                        r_slots     <= {LOG_CNT_WIDTH{1'b0}};
+                        r_pending   <= {LOG_CNT_WIDTH{1'b0}};
+                        r_drop_cnt  <= {LOG_CNT_WIDTH{1'b0}};
+                        r_stop_full <= 1'b0;
+                        r_done      <= 1'b0;
+                        r_overflow  <= 1'b0;
+                        r_lg_state  <= LG_REC;
+                    end
+                end
+
+                LG_REC: begin
+                    if (rec_claim) begin
+                        r_slots <= r_slots + 1'b1;
+                        if (rec_fits) begin
+                            r_pending <= {LOG_CNT_WIDTH{1'b0}};
+                        end else begin
+                            r_pending  <= r_pending + 1'b1;
+                            r_drop_cnt <= r_drop_cnt + 1'b1;
+                            r_overflow <= 1'b1;
+                        end
+                    end
+
+                    if (rec_last_slot) begin
+                        // Region full.  If this record was dropped, its zero
+                        // (and any earlier owed zeros) still need a FIFO entry.
+                        r_stop_full <= 1'b1;
+                        r_lg_state  <= rec_fits ? LG_DRAIN : LG_FINAL;
+                    end else if (!en_s) begin
+                        r_lg_state  <= LG_FINAL;
+                    end
+                end
+
+                LG_FINAL: begin
+                    if (!fifo_no_room) begin
+                        r_slots    <= r_slots + final_pad;
+                        r_pending  <= {LOG_CNT_WIDTH{1'b0}};
+                        r_lg_state <= LG_DRAIN;
+                    end
+                end
+
+                LG_DRAIN: begin
+                    if (log_tlast_fire) begin
+                        r_done     <= 1'b1;
+                        r_lg_state <= LG_IDLE;
+                    end
+                end
+
+                default: r_lg_state <= LG_IDLE;
+            endcase
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Zero expander (FIFO read side): one record per cycle
+    // ------------------------------------------------------------
+    wire                     h_valid  = !fifo_empty;
+    wire                     h_last   = fifo_dout[LOG_FIFO_WIDTH-1];
+    wire [LOG_CNT_WIDTH-1:0] h_zcnt   = fifo_dout[LOG_FIFO_WIDTH-2 -: LOG_CNT_WIDTH];
+    wire                     h_rvalid = fifo_dout[LOG_DATA_BITS];
+    wire [LOG_DATA_BITS-1:0] h_rec    = fifo_dout[LOG_DATA_BITS-1:0];
+
+    reg  [LOG_CNT_WIDTH-1:0] r_zdone;      // zeros already emitted for the head entry
+    wire                     pk_accept;    // beat packer can take a record
+
+    wire                     z_phase   = (r_zdone != h_zcnt);
+    wire                     z_lastone = ((r_zdone + 1'b1) == h_zcnt);
+    wire                     emit      = h_valid && pk_accept;
+    wire                     emit_pop  = emit && (!z_phase || (z_lastone && !h_rvalid));
+    wire                     emit_last = emit_pop && h_last;
+    wire [LOG_REC_BITS-1:0]  emit_rec  = z_phase ? {LOG_REC_BITS{1'b0}}
+                                                 : {{(LOG_REC_BITS-LOG_DATA_BITS){1'b0}}, h_rec};
+
+    assign fifo_rd_en = emit_pop;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            r_zdone <= {LOG_CNT_WIDTH{1'b0}};
+        else if (emit)
+            r_zdone <= emit_pop ? {LOG_CNT_WIDTH{1'b0}} : r_zdone + 1'b1;
+    end
+
+    // ------------------------------------------------------------
+    // Beat packer: LOG_RECS_PER_BEAT records per beat, record i at
+    // tdata[128*i +: 128] so records land in DDR in order.  Region size
+    // and enable-stop padding guarantee the tlast record closes a beat.
+    // ------------------------------------------------------------
+    reg [LOG_TDATA_WIDTH-1:0] r_asm;
+    reg [LOG_BEAT_IDX_W-1:0]  r_asm_idx;
+    reg [LOG_TDATA_WIDTH-1:0] r_out_data;
+    reg                       r_out_valid;
+    reg                       r_out_last;
+    reg [LOG_TDATA_WIDTH-1:0] beat_next;
+
+    wire out_free     = !r_out_valid || m_axis_log_tready;
+    wire asm_complete = (r_asm_idx == LOG_RECS_PER_BEAT - 1);
+
+    assign pk_accept = !asm_complete || out_free;
+
+    always @(*) begin
+        beat_next = r_asm;
+        beat_next[r_asm_idx*LOG_REC_BITS +: LOG_REC_BITS] = emit_rec;
+    end
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            r_asm       <= {LOG_TDATA_WIDTH{1'b0}};
+            r_asm_idx   <= {LOG_BEAT_IDX_W{1'b0}};
+            r_out_data  <= {LOG_TDATA_WIDTH{1'b0}};
+            r_out_valid <= 1'b0;
+            r_out_last  <= 1'b0;
+        end else begin
+            if (r_out_valid && m_axis_log_tready)
+                r_out_valid <= 1'b0;
+
+            if (emit) begin
+                if (asm_complete) begin
+                    r_out_data  <= beat_next;
+                    r_out_valid <= 1'b1;
+                    r_out_last  <= emit_last;
+                    r_asm       <= {LOG_TDATA_WIDTH{1'b0}};
+                    r_asm_idx   <= {LOG_BEAT_IDX_W{1'b0}};
+                end else begin
+                    r_asm       <= beat_next;
+                    r_asm_idx   <= r_asm_idx + 1'b1;
+                end
+            end
+        end
+    end
+
+    // synthesis translate_off
+    always @(posedge clk) begin
+        if (rst_n && emit && emit_last && !asm_complete)
+            $display("ERROR: %m tlast record does not close a beat (t=%0t)", $time);
+    end
+    // synthesis translate_on
+
+    assign log_tlast_fire    = r_out_valid && r_out_last && m_axis_log_tready;
+
+    assign m_axis_log_tdata  = r_out_data;
+    assign m_axis_log_tkeep  = {(LOG_TDATA_WIDTH/8){1'b1}};
+    assign m_axis_log_tvalid = r_out_valid;
+    assign m_axis_log_tlast  = r_out_last;
+
+    assign log_busy          = (r_lg_state != LG_IDLE);
+    assign log_done          = r_done;
+    assign log_overflow      = r_overflow;
+    assign log_drop_count    = r_drop_cnt;   // zero-extended to 32 bits
+
+end else begin : gen_no_dma_log
+
+    assign m_axis_log_tdata  = {LOG_TDATA_WIDTH{1'b0}};
+    assign m_axis_log_tkeep  = {(LOG_TDATA_WIDTH/8){1'b0}};
+    assign m_axis_log_tvalid = 1'b0;
+    assign m_axis_log_tlast  = 1'b0;
+    assign log_busy          = 1'b0;
+    assign log_done          = 1'b0;
+    assign log_overflow      = 1'b0;
+    assign log_drop_count    = 32'd0;
+
+end
+endgenerate
+
+// =================================================================
 // Integrated Logic Analyzer (ILA) for Debug
 // Each signal has a dedicated probe for easy viewing and independent triggering
 // =================================================================
@@ -618,7 +1012,7 @@ end
 wire [63:0] tel_pkt_addr_byte = {tel_pkt_addr, 2'b00};
 
 generate
-    if (ENABLE_ILA == 1) begin : gen_ila
+    if (ENABLE_ILA == 1 && DMA_LOG == 0) begin : gen_ila
         ila_0 u_ila_telemetry (
             .clk     (clk),
             
