@@ -7,20 +7,25 @@
 //
 // Dataflow:
 //   in0 -> u_telemetry_0 (RQ) -> axi4_mwr_batch.s_axis_0 -.
-//                                                          +-> m_axis (out)
+//                                                          +-> [u_telemetry_out] -> m_axis (out)
 //   in1 -> u_telemetry_1 (RQ) -> axi4_mwr_batch.s_axis_1 -'
 //
 // Configured for the Requester Request (RQ) interface:
 //   - IF_TYPE = "RQ" on all sub-modules (selects tuser sop/eop offsets)
 //   - AXIS_TUSER_WIDTH = 137 (RQ non-PASID tuser width, PG343 §3.1/§3.2)
 //
-// axi4_telemetry is a transparent passthrough that snoops each input
-// stream and records per-packet telemetry (length, gap, type, address,
-// tag); it does not alter the data path feeding the batcher.  With
-// DMA_LOG = 0 the records are played back into an internal ILA; with
-// DMA_LOG = 1 each port streams its records on m_axis_log_<n>_* to an
-// external AXI DMA (S2MM), both ports armed by the shared log_enable.
-// Record format: telemetry_dma_format.md.
+// axi4_telemetry is a transparent passthrough that snoops a stream and
+// records per-packet telemetry (length, gap, type, address, tag); it does
+// not alter the data path.
+//
+//   DMA_LOG = 0 : the two input taps play their records back into their own
+//                 ILA (ENABLE_ILA).  The log_* / m_axis_log_* ports are inert.
+//   DMA_LOG = 1 : a third tap (u_telemetry_out) snoops the batched output, and
+//                 u_logger merges all three into ONE stream, m_axis_log_*, for an
+//                 external AXI DMA (S2MM).  Each record is tagged with its port:
+//                   port 0 = in0, port 1 = in1, port 2 = out.
+//                 One log_enable arms all three; one status set reports.
+//                 Record format: telemetry_dma_format.md.
 // =================================================================
 module axi4_mwr_batch_top #(
     parameter integer AXIS_DATA_WIDTH  = 512,
@@ -36,9 +41,11 @@ module axi4_mwr_batch_top #(
     parameter integer DATA_FIDELITY    = 8,
     parameter integer ILA_DEPTH        = 0,
     parameter         ENABLE_ILA       = 1,             // per-port ILA in each telemetry block (DMA_LOG = 0)
-    parameter         DMA_LOG          = 0,             // 1 = log records to DDR via external AXI DMA
-    parameter integer DMA_REGION_BYTES = 1048576,       // per-port DDR region size, bytes
-    parameter integer LOG_TDATA_WIDTH  = 128            // m_axis_log_<n> tdata width
+    // --- DMA logging (axi4_telemetry_logger, DMA_LOG = 1) ---
+    parameter         DMA_LOG          = 0,             // 1 = log all three ports to DDR via external AXI DMA
+    parameter integer DMA_REGION_BYTES = 1048576,       // DDR region size, bytes (one region for all ports)
+    parameter integer LOG_TDATA_WIDTH  = 128,           // m_axis_log tdata width
+    parameter integer LOG_FIFO_DEPTH   = 512            // logger FIFO depth, entries (cycles with a TLP end)
 )(
     input  wire                          clk,
     input  wire                          rst_n,
@@ -75,27 +82,17 @@ module axi4_mwr_batch_top #(
     input  wire                          m_axis_tready,
 
     // -------- Telemetry DMA logging (DMA_LOG = 1) --------
-    input  wire                          log_enable,       // rising edge arms both ports
-
-    output wire                          log_busy_0,
-    output wire                          log_done_0,
-    output wire                          log_overflow_0,
-    output wire [31:0]                   log_drop_count_0,
-    output wire [LOG_TDATA_WIDTH-1:0]    m_axis_log_0_tdata,
-    output wire [LOG_TDATA_WIDTH/8-1:0]  m_axis_log_0_tkeep,
-    output wire                          m_axis_log_0_tvalid,
-    output wire                          m_axis_log_0_tlast,
-    input  wire                          m_axis_log_0_tready,
-
-    output wire                          log_busy_1,
-    output wire                          log_done_1,
-    output wire                          log_overflow_1,
-    output wire [31:0]                   log_drop_count_1,
-    output wire [LOG_TDATA_WIDTH-1:0]    m_axis_log_1_tdata,
-    output wire [LOG_TDATA_WIDTH/8-1:0]  m_axis_log_1_tkeep,
-    output wire                          m_axis_log_1_tvalid,
-    output wire                          m_axis_log_1_tlast,
-    input  wire                          m_axis_log_1_tready
+    input  wire                          log_enable,       // rising edge arms; low (or region full) stops
+    output wire                          log_busy,
+    output wire                          log_done,
+    output wire                          log_overflow,
+    output wire [1:0]                    log_stop_reason,  // 1 = log_enable low, 2 = region full
+    output wire [31:0]                   log_drop_count,
+    output wire [LOG_TDATA_WIDTH-1:0]    m_axis_log_tdata,
+    output wire [LOG_TDATA_WIDTH/8-1:0]  m_axis_log_tkeep,
+    output wire                          m_axis_log_tvalid,
+    output wire                          m_axis_log_tlast,
+    input  wire                          m_axis_log_tready
 );
 
     // =============================================================
@@ -108,6 +105,18 @@ module axi4_mwr_batch_top #(
     wire [AXIS_TUSER_WIDTH-1:0]   tel0_tuser,  tel1_tuser;
     wire                          tel0_tready, tel1_tready;
 
+    // Batcher -> output (through u_telemetry_out when DMA_LOG = 1)
+    wire [AXIS_DATA_WIDTH-1:0]    bat_tdata;
+    wire [AXIS_DATA_WIDTH/32-1:0] bat_tkeep;
+    wire                          bat_tvalid;
+    wire                          bat_tlast;
+    wire [AXIS_TUSER_WIDTH-1:0]   bat_tuser;
+    wire                          bat_tready;
+
+    // Record taps: port 0 = in0, 1 = in1, 2 = out
+    wire [2:0]                    tap_valid;
+    wire [3*112-1:0]              tap_data;
+
     // =============================================================
     // Port 0 telemetry passthrough (RQ)
     // =============================================================
@@ -119,9 +128,7 @@ module axi4_mwr_batch_top #(
         .ILA_DEPTH        (ILA_DEPTH),
         .ENABLE_ILA       (ENABLE_ILA),
         .IF_TYPE          ("RQ"),
-        .DMA_LOG          (DMA_LOG),
-        .DMA_REGION_BYTES (DMA_REGION_BYTES),
-        .LOG_TDATA_WIDTH  (LOG_TDATA_WIDTH)
+        .DMA_LOG          (DMA_LOG)
     ) u_telemetry_0 (
         .clk           (clk),
         .rst_n         (rst_n),
@@ -139,17 +146,9 @@ module axi4_mwr_batch_top #(
         .m_axis_tlast  (tel0_tlast),
         .m_axis_tuser  (tel0_tuser),
         .m_axis_tready (tel0_tready),
-        // DMA log
-        .log_enable        (log_enable),
-        .log_busy          (log_busy_0),
-        .log_done          (log_done_0),
-        .log_overflow      (log_overflow_0),
-        .log_drop_count    (log_drop_count_0),
-        .m_axis_log_tdata  (m_axis_log_0_tdata),
-        .m_axis_log_tkeep  (m_axis_log_0_tkeep),
-        .m_axis_log_tvalid (m_axis_log_0_tvalid),
-        .m_axis_log_tlast  (m_axis_log_0_tlast),
-        .m_axis_log_tready (m_axis_log_0_tready)
+        // record tap
+        .log_rec_valid (tap_valid[0]),
+        .log_rec_data  (tap_data[0*112 +: 112])
     );
 
     // =============================================================
@@ -163,9 +162,7 @@ module axi4_mwr_batch_top #(
         .ILA_DEPTH        (ILA_DEPTH),
         .ENABLE_ILA       (ENABLE_ILA),
         .IF_TYPE          ("RQ"),
-        .DMA_LOG          (DMA_LOG),
-        .DMA_REGION_BYTES (DMA_REGION_BYTES),
-        .LOG_TDATA_WIDTH  (LOG_TDATA_WIDTH)
+        .DMA_LOG          (DMA_LOG)
     ) u_telemetry_1 (
         .clk           (clk),
         .rst_n         (rst_n),
@@ -183,17 +180,9 @@ module axi4_mwr_batch_top #(
         .m_axis_tlast  (tel1_tlast),
         .m_axis_tuser  (tel1_tuser),
         .m_axis_tready (tel1_tready),
-        // DMA log
-        .log_enable        (log_enable),
-        .log_busy          (log_busy_1),
-        .log_done          (log_done_1),
-        .log_overflow      (log_overflow_1),
-        .log_drop_count    (log_drop_count_1),
-        .m_axis_log_tdata  (m_axis_log_1_tdata),
-        .m_axis_log_tkeep  (m_axis_log_1_tkeep),
-        .m_axis_log_tvalid (m_axis_log_1_tvalid),
-        .m_axis_log_tlast  (m_axis_log_1_tlast),
-        .m_axis_log_tready (m_axis_log_1_tready)
+        // record tap
+        .log_rec_valid (tap_valid[1]),
+        .log_rec_data  (tap_data[1*112 +: 112])
     );
 
     // =============================================================
@@ -228,13 +217,102 @@ module axi4_mwr_batch_top #(
         .s_axis_tlast_1  (tel1_tlast),
         .s_axis_tuser_1  (tel1_tuser),
         .s_axis_tready_1 (tel1_tready),
-        // master -> top output
-        .m_axis_tdata    (m_axis_tdata),
-        .m_axis_tkeep    (m_axis_tkeep),
-        .m_axis_tvalid   (m_axis_tvalid),
-        .m_axis_tlast    (m_axis_tlast),
-        .m_axis_tuser    (m_axis_tuser),
-        .m_axis_tready   (m_axis_tready)
+        // master -> output
+        .m_axis_tdata    (bat_tdata),
+        .m_axis_tkeep    (bat_tkeep),
+        .m_axis_tvalid   (bat_tvalid),
+        .m_axis_tlast    (bat_tlast),
+        .m_axis_tuser    (bat_tuser),
+        .m_axis_tready   (bat_tready)
     );
+
+    generate
+    if (DMA_LOG == 1) begin : gen_dma_log
+
+        // =========================================================
+        // Output-port telemetry tap (RQ) — passthrough on the batched stream
+        // =========================================================
+        axi4_telemetry #(
+            .AXIS_DATA_WIDTH  (AXIS_DATA_WIDTH),
+            .AXIS_TUSER_WIDTH (AXIS_TUSER_WIDTH),
+            .TELEMETRY_DEPTH  (TELEMETRY_DEPTH),
+            .DATA_FIDELITY    (DATA_FIDELITY),
+            .ILA_DEPTH        (ILA_DEPTH),
+            .ENABLE_ILA       (0),
+            .IF_TYPE          ("RQ"),
+            .DMA_LOG          (1)
+        ) u_telemetry_out (
+            .clk           (clk),
+            .rst_n         (rst_n),
+            // slave <- batcher master
+            .s_axis_tdata  (bat_tdata),
+            .s_axis_tkeep  (bat_tkeep),
+            .s_axis_tvalid (bat_tvalid),
+            .s_axis_tlast  (bat_tlast),
+            .s_axis_tuser  (bat_tuser),
+            .s_axis_tready (bat_tready),
+            // master -> top output
+            .m_axis_tdata  (m_axis_tdata),
+            .m_axis_tkeep  (m_axis_tkeep),
+            .m_axis_tvalid (m_axis_tvalid),
+            .m_axis_tlast  (m_axis_tlast),
+            .m_axis_tuser  (m_axis_tuser),
+            .m_axis_tready (m_axis_tready),
+            // record tap
+            .log_rec_valid (tap_valid[2]),
+            .log_rec_data  (tap_data[2*112 +: 112])
+        );
+
+        // =========================================================
+        // Merge the three taps into one DMA stream
+        // =========================================================
+        axi4_telemetry_logger #(
+            .NUM_PORTS        (3),
+            .FIFO_DEPTH       (LOG_FIFO_DEPTH),
+            .DMA_REGION_BYTES (DMA_REGION_BYTES),
+            .LOG_TDATA_WIDTH  (LOG_TDATA_WIDTH)
+        ) u_logger (
+            .clk               (clk),
+            .rst_n             (rst_n),
+            .rec_valid         (tap_valid),
+            .rec_data          (tap_data),
+            .log_enable        (log_enable),
+            .log_busy          (log_busy),
+            .log_done          (log_done),
+            .log_overflow      (log_overflow),
+            .log_stop_reason   (log_stop_reason),
+            .log_drop_count    (log_drop_count),
+            .m_axis_log_tdata  (m_axis_log_tdata),
+            .m_axis_log_tkeep  (m_axis_log_tkeep),
+            .m_axis_log_tvalid (m_axis_log_tvalid),
+            .m_axis_log_tlast  (m_axis_log_tlast),
+            .m_axis_log_tready (m_axis_log_tready)
+        );
+
+    end else begin : gen_no_dma_log
+
+        // Batcher drives the output directly
+        assign m_axis_tdata      = bat_tdata;
+        assign m_axis_tkeep      = bat_tkeep;
+        assign m_axis_tvalid     = bat_tvalid;
+        assign m_axis_tlast      = bat_tlast;
+        assign m_axis_tuser      = bat_tuser;
+        assign bat_tready        = m_axis_tready;
+
+        assign tap_valid[2]      = 1'b0;
+        assign tap_data[2*112 +: 112] = 112'd0;
+
+        assign log_busy          = 1'b0;
+        assign log_done          = 1'b0;
+        assign log_overflow      = 1'b0;
+        assign log_stop_reason   = 2'd0;
+        assign log_drop_count    = 32'd0;
+        assign m_axis_log_tdata  = {LOG_TDATA_WIDTH{1'b0}};
+        assign m_axis_log_tkeep  = {(LOG_TDATA_WIDTH/8){1'b0}};
+        assign m_axis_log_tvalid = 1'b0;
+        assign m_axis_log_tlast  = 1'b0;
+
+    end
+    endgenerate
 
 endmodule
