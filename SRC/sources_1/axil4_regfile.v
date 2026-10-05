@@ -108,9 +108,10 @@ module axil4_regfile #(
 )(
     // ---- Clock and reset (bound to the S_AXI interface) -------------------
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 S_AXI_ACLK CLK" *)
-    // FREQ_HZ is a placeholder: Vivado overwrites it during clock propagation
-    // once the module is connected in a block design.
-    (* X_INTERFACE_PARAMETER = "XIL_INTERFACENAME S_AXI_ACLK, ASSOCIATED_BUSIF S_AXI, ASSOCIATED_RESET s_axi_aresetn, FREQ_HZ 100000000, PHASE 0.0, INSERT_VIP 0" *)
+    // FREQ_HZ must match the clock driving s_axi_aclk in the block design (the
+    // 250 MHz upstream PCIe user_clk in pips.tcl): Vivado 2021.2 treats it as a
+    // fixed, read-only value on module references and fails validation on a mismatch.
+    (* X_INTERFACE_PARAMETER = "XIL_INTERFACENAME S_AXI_ACLK, ASSOCIATED_BUSIF S_AXI, ASSOCIATED_RESET s_axi_aresetn, FREQ_HZ 250000000, PHASE 0.0, INSERT_VIP 0" *)
     input  wire                              s_axi_aclk,
 
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 S_AXI_ARESETN RST" *)
