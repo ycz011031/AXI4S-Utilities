@@ -736,10 +736,9 @@ localparam [2:0] MST_SERVE_2 = 3'd3;   // transmitting a packet from FIFO 2 (pas
 localparam [2:0] MST_SERVE_3 = 3'd4;   // transmitting a packet from FIFO 3 (ch0 MRd batch)
 localparam [2:0] MST_SERVE_4 = 3'd5;   // transmitting a packet from FIFO 4 (ch1 MRd batch)
 
-// --- State register and per-channel aging counters ---
+// --- State register and channel round-robin pointer ---
 reg [2:0] r_mst_state;
-reg [7:0] r_wait_0;    // cycles ch0 has been requesting-but-not-served (saturates at 8'hFF)
-reg [7:0] r_wait_1;    // same for ch1
+reg       r_rr_last;   // channel given the most recent batching-FIFO grant (0 = ch0, 1 = ch1)
 
 // --- Packet-in-flight flag (master side) ---
 // 1 = a packet has begun transmission (a non-EOP beat was accepted) and its
@@ -1063,7 +1062,8 @@ wire full_active_3 = !empty_3 && (space_3 < r_max_len_3);
 wire full_active_4 = !empty_4 && (space_4 < r_max_len_4);
 
 // Timeout counters — increment while FIFO is non-empty, saturate at
-// time_threshold, reset to 0 when the FIFO empties (burst ended)
+// time_threshold, reset to 0 when the FIFO empties (burst ended) or a drain
+// completes (batch ended)
 reg [TIME_FEDILITY-1:0]   r_to_cnt_0, r_to_cnt_1, r_to_cnt_3, r_to_cnt_4;
 
 // 3-bit batching priority per batching FIFO (internal, consumed by the arbiter):
@@ -1077,21 +1077,68 @@ wire to_active_3 = !empty_3 && (r_to_cnt_3 >= time_threshold);
 wire to_active_4 = !empty_4 && (r_to_cnt_4 >= time_threshold);
 
 // -----------------------------------------------------------------------------
-// DRAIN state — one latch per batching FIFO.
+// DRAIN state — one latch per batching FIFO, plus a snapshot of what to drain.
 //
-// Every trigger means the same thing: "this FIFO should now be drained".  Any of
-// them — timeout, packet depth, or full — SETS the drain latch, and the latch
-// holds until the FIFO is EMPTY.  So a FIFO that has been declared ready is
-// emptied completely, rather than served only until the momentary condition
-// stops holding (which for the depth trigger would emit a single packet and
-// re-batch, and for the full trigger would hover at the threshold).
+// Every trigger means the same thing: "the batch in this FIFO is ready".  Any of
+// them — timeout, packet depth, or full — SETS the drain latch, which requests
+// a grant from the arbiter.  A grant is a whole drain: when the FIFO is granted,
+// the number of packets in it is snapshotted (r_snap_x) and the arbiter keeps
+// the grant on that channel until exactly those packets are out (see the batch
+// hold in the arbitration section).  r_snap_x counts down on each EOP read out;
+// when the last one leaves, the latch clears together with the trigger flags and
+// the timeout counter.  Packets that arrived after the grant stay in the FIFO as
+// the next batch, which has to trigger and win a grant on its own.
 //
-// Fairness: the drain latch only makes a FIFO ELIGIBLE for the arbiter.  The FSM
-// still re-arbitrates at every packet boundary, FIFO 2 keeps its interleave
-// precedence, and the aging counters pick between two eligible channels — so a
-// draining FIFO cannot monopolise the master interface.
+// The snapshot is taken at the grant, not at the trigger, so a FIFO that waited
+// out the other channel's drain takes everything it accumulated meanwhile.
+// Under saturation the two channels then alternate drains of a FIFO's worth each.
+//
+// Draining to EMPTY instead (the earlier behaviour) never finishes under
+// sustained input, because the FIFO keeps admitting while it drains: the latch
+// and the saturated timeout then stayed set permanently and batching degenerated
+// into a per-packet interleave.
+//
+// The snapshot counts every packet with at least one beat in the FIFO — the
+// resident complete packets plus the one still being written, i.e. the write
+// pointer rounded up to the next packet boundary.  The partial packet has to be
+// included: one longer than the admit space can only complete if the drain
+// streams it out cut-through, so leaving it out would deadlock the full trigger.
+//
+// Fairness: a channel holds the master interface for at most one snapshot (one
+// FIFO's worth), then the round-robin pointer hands it to the other channel if
+// that one is waiting.  FIFO 2 keeps its interleave precedence at every packet
+// boundary, including inside a drain.
 // -----------------------------------------------------------------------------
-reg r_drain_0, r_drain_1, r_drain_3, r_drain_4;
+reg                  r_drain_0,    r_drain_1,    r_drain_3,    r_drain_4;
+reg                  r_snap_vld_0, r_snap_vld_1, r_snap_vld_3, r_snap_vld_4;  // granted: snapshot latched
+reg [FIFO_CNT_W-1:0] r_snap_0,     r_snap_1,     r_snap_3,     r_snap_4;      // snapshot packets still to drain
+
+// The master FSM granting FIFO x this cycle (assigned with the arbiter below).
+wire grant_0, grant_1, grant_3, grant_4;
+
+// Packets with at least one beat in FIFO x as of the coming edge: resident
+// complete packets (the next value of r_pkt_cnt_x, so an EOP committing or
+// popping this cycle is accounted for) plus a packet still being written.
+wire [FIFO_CNT_W-1:0] snap_now_0 = r_pkt_cnt_0 + (wr_eop_0 ? 1'b1 : 1'b0) - (rd_eop_0 ? 1'b1 : 1'b0)
+                                               + ((r_beat_cnt_0 != 0) ? 1'b1 : 1'b0);
+wire [FIFO_CNT_W-1:0] snap_now_1 = r_pkt_cnt_1 + (wr_eop_1 ? 1'b1 : 1'b0) - (rd_eop_1 ? 1'b1 : 1'b0)
+                                               + ((r_beat_cnt_1 != 0) ? 1'b1 : 1'b0);
+wire [FIFO_CNT_W-1:0] snap_now_3 = r_pkt_cnt_3 + (wr_eop_3 ? 1'b1 : 1'b0) - (rd_eop_3 ? 1'b1 : 1'b0)
+                                               + ((r_beat_cnt_3 != 0) ? 1'b1 : 1'b0);
+wire [FIFO_CNT_W-1:0] snap_now_4 = r_pkt_cnt_4 + (wr_eop_4 ? 1'b1 : 1'b0) - (rd_eop_4 ? 1'b1 : 1'b0)
+                                               + ((r_beat_cnt_4 != 0) ? 1'b1 : 1'b0);
+
+// Drain request: a trigger flag is up and there is something to drain.
+wire drain_go_0 = !r_drain_0 && (|priority_0) && (snap_now_0 != 0);
+wire drain_go_1 = !r_drain_1 && (|priority_1) && (snap_now_1 != 0);
+wire drain_go_3 = !r_drain_3 && (|priority_3) && (snap_now_3 != 0);
+wire drain_go_4 = !r_drain_4 && (|priority_4) && (snap_now_4 != 0);
+
+// Drain end: the last snapshot packet's EOP is being read out.
+wire drain_done_0 = r_snap_vld_0 && rd_eop_0 && (r_snap_0 == 1);
+wire drain_done_1 = r_snap_vld_1 && rd_eop_1 && (r_snap_1 == 1);
+wire drain_done_3 = r_snap_vld_3 && rd_eop_3 && (r_snap_3 == 1);
+wire drain_done_4 = r_snap_vld_4 && rd_eop_4 && (r_snap_4 == 1);
 
 // =================================================================
 // Batching-Priority Process
@@ -1099,12 +1146,16 @@ reg r_drain_0, r_drain_1, r_drain_3, r_drain_4;
 //  Timeout counter (per batching FIFO):
 //    • Increments every cycle while the FIFO is non-empty.
 //    • Saturates at time_threshold (no wrap-around).
-//    • Resets when the FIFO empties (burst ended).
+//    • Resets when the FIFO empties (burst ended) or a drain completes (batch
+//      ended), so the packets left behind get a fresh timeout window.
 //    • priority[0] is asserted while counter >= time_threshold.
 //
 //  priority[1] (packet depth) and priority[2] (full) are registered replicas of
 //  the combinatorial conditions above, updated every cycle.  Any of the three
-//  sets that FIFO's drain latch, which holds until the FIFO is empty.
+//  starts a snapshot drain (see DRAIN state above).  All three are forced low
+//  for the cycle after a drain completes: they were computed from pre-release
+//  state (saturated timer, depth still counting the last packet out) and would
+//  otherwise restart a drain on the leftover packets straight away.
 // =================================================================
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
@@ -1136,22 +1187,31 @@ always @(posedge clk or negedge rst_n) begin
         r_drain_1    <= 1'b0;
         r_drain_3    <= 1'b0;
         r_drain_4    <= 1'b0;
+        r_snap_vld_0 <= 1'b0;
+        r_snap_vld_1 <= 1'b0;
+        r_snap_vld_3 <= 1'b0;
+        r_snap_vld_4 <= 1'b0;
+        r_snap_0     <= {FIFO_CNT_W{1'b0}};
+        r_snap_1     <= {FIFO_CNT_W{1'b0}};
+        r_snap_3     <= {FIFO_CNT_W{1'b0}};
+        r_snap_4     <= {FIFO_CNT_W{1'b0}};
     end else begin
 
         // ----------------------------------------------------------
         // Timeout counters
-        // Reset on FIFO empty; count up to (and hold at) time_threshold
+        // Reset on FIFO empty or drain completion; count up to (and
+        // hold at) time_threshold
         // ----------------------------------------------------------
-        if      (empty_0)                     r_to_cnt_0 <= {TIME_FEDILITY{1'b0}};
+        if      (empty_0 || drain_done_0)     r_to_cnt_0 <= {TIME_FEDILITY{1'b0}};
         else if (r_to_cnt_0 < time_threshold) r_to_cnt_0 <= r_to_cnt_0 + 1'b1;
 
-        if      (empty_1)                     r_to_cnt_1 <= {TIME_FEDILITY{1'b0}};
+        if      (empty_1 || drain_done_1)     r_to_cnt_1 <= {TIME_FEDILITY{1'b0}};
         else if (r_to_cnt_1 < time_threshold) r_to_cnt_1 <= r_to_cnt_1 + 1'b1;
 
-        if      (empty_3)                     r_to_cnt_3 <= {TIME_FEDILITY{1'b0}};
+        if      (empty_3 || drain_done_3)     r_to_cnt_3 <= {TIME_FEDILITY{1'b0}};
         else if (r_to_cnt_3 < time_threshold) r_to_cnt_3 <= r_to_cnt_3 + 1'b1;
 
-        if      (empty_4)                     r_to_cnt_4 <= {TIME_FEDILITY{1'b0}};
+        if      (empty_4 || drain_done_4)     r_to_cnt_4 <= {TIME_FEDILITY{1'b0}};
         else if (r_to_cnt_4 < time_threshold) r_to_cnt_4 <= r_to_cnt_4 + 1'b1;
 
         // ----------------------------------------------------------
@@ -1221,34 +1281,78 @@ always @(posedge clk or negedge rst_n) begin
         //   [0] = timeout : FIFO non-empty, counter has hit threshold
         //   [1] = depth   : resident packet count has reached depth_threshold
         //   [2] = full    : free space below one full max-length packet
+        // All cleared for one cycle when a drain completes (stale, see above).
         // ----------------------------------------------------------
-        priority_0 <= {full_active_0, depth_active_0, to_active_0};
-        priority_1 <= {full_active_1, depth_active_1, to_active_1};
-        priority_3 <= {full_active_3, depth_active_3, to_active_3};
-        priority_4 <= {full_active_4, depth_active_4, to_active_4};
+        priority_0 <= drain_done_0 ? 3'b000 : {full_active_0, depth_active_0, to_active_0};
+        priority_1 <= drain_done_1 ? 3'b000 : {full_active_1, depth_active_1, to_active_1};
+        priority_3 <= drain_done_3 ? 3'b000 : {full_active_3, depth_active_3, to_active_3};
+        priority_4 <= drain_done_4 ? 3'b000 : {full_active_4, depth_active_4, to_active_4};
 
         // ----------------------------------------------------------
-        // Drain latches: set by any trigger, cleared once the FIFO is truly
-        // drained.  The clear uses the exact fx_pending in-flight counter, NOT
-        // empty_x: the FWFT empty flag lags a write, so it can read high while
-        // beats are still resident, and clearing on it ends a drain episode
-        // early and leaves a partial batch behind (observed in simulation).
-        // fx_pending is write-commit/read-exact, so it falls only when the last
-        // beat has actually been read out.  The clear takes precedence, so the
-        // latch always releases at the end of a drain even if a trigger is
-        // still (stale) asserted.
+        // Drain latches and snapshots: a trigger requests a drain; the
+        // first grant of the FIFO snapshots the packets to send; each
+        // EOP read out counts the snapshot down, and the last one ends
+        // the drain.
+        //
+        // The FIFO going truly idle also ends a drain, and takes
+        // precedence.  That uses the exact fx_pending in-flight counter,
+        // NOT empty_x: the FWFT empty flag lags a write, so it can read
+        // high while beats are still resident, and clearing on it ends a
+        // drain episode early and leaves a partial batch behind (observed
+        // in simulation).  fx_pending is write-commit/read-exact, so it
+        // falls only when the last beat has actually been read out.
         // ----------------------------------------------------------
-        if      (!f0_pending)   r_drain_0 <= 1'b0;
-        else if (|priority_0)   r_drain_0 <= 1'b1;
+        if (!f0_pending || drain_done_0) begin
+            r_drain_0    <= 1'b0;
+            r_snap_vld_0 <= 1'b0;
+        end else begin
+            if (drain_go_0)                    r_drain_0 <= 1'b1;
+            if (r_snap_vld_0) begin
+                if (rd_eop_0)                  r_snap_0  <= r_snap_0 - 1'b1;
+            end else if (r_drain_0 && grant_0) begin
+                r_snap_vld_0 <= 1'b1;
+                r_snap_0     <= snap_now_0;
+            end
+        end
 
-        if      (!f1_pending)   r_drain_1 <= 1'b0;
-        else if (|priority_1)   r_drain_1 <= 1'b1;
+        if (!f1_pending || drain_done_1) begin
+            r_drain_1    <= 1'b0;
+            r_snap_vld_1 <= 1'b0;
+        end else begin
+            if (drain_go_1)                    r_drain_1 <= 1'b1;
+            if (r_snap_vld_1) begin
+                if (rd_eop_1)                  r_snap_1  <= r_snap_1 - 1'b1;
+            end else if (r_drain_1 && grant_1) begin
+                r_snap_vld_1 <= 1'b1;
+                r_snap_1     <= snap_now_1;
+            end
+        end
 
-        if      (!f3_pending)   r_drain_3 <= 1'b0;
-        else if (|priority_3)   r_drain_3 <= 1'b1;
+        if (!f3_pending || drain_done_3) begin
+            r_drain_3    <= 1'b0;
+            r_snap_vld_3 <= 1'b0;
+        end else begin
+            if (drain_go_3)                    r_drain_3 <= 1'b1;
+            if (r_snap_vld_3) begin
+                if (rd_eop_3)                  r_snap_3  <= r_snap_3 - 1'b1;
+            end else if (r_drain_3 && grant_3) begin
+                r_snap_vld_3 <= 1'b1;
+                r_snap_3     <= snap_now_3;
+            end
+        end
 
-        if      (!f4_pending)   r_drain_4 <= 1'b0;
-        else if (|priority_4)   r_drain_4 <= 1'b1;
+        if (!f4_pending || drain_done_4) begin
+            r_drain_4    <= 1'b0;
+            r_snap_vld_4 <= 1'b0;
+        end else begin
+            if (drain_go_4)                    r_drain_4 <= 1'b1;
+            if (r_snap_vld_4) begin
+                if (rd_eop_4)                  r_snap_4  <= r_snap_4 - 1'b1;
+            end else if (r_drain_4 && grant_4) begin
+                r_snap_vld_4 <= 1'b1;
+                r_snap_4     <= snap_now_4;
+            end
+        end
 
     end
 end
@@ -1259,20 +1363,28 @@ end
 // Priority order:
 //   1. FIFO 2 (pass-through): always interleaves when it has data — even
 //      mid-burst.
-//   2. The requesting channel's batching FIFO: MWr FIFO (0/1) first, else the
-//      dedicated MRd FIFO (3/4).  A FIFO requests when it is draining, when a
-//      trigger fires, or when a pass-through beat is stalled behind it on the
-//      same channel and it must be emptied first to honour PCIe ordering (the
-//      flush request releases the ch_bar_ok barrier in the ready logic).
-//      Tie-breaking between the two channels:
-//        • Any timeout flag asserted  → channel 1 always wins
-//        • Otherwise                  → higher aging count (older) wins
+//   2. The channel holding the batch grant (r_batch_open), until its drain is
+//      done.  A grant is a whole drain: the owner is re-granted at every packet
+//      boundary until its snapshot is out, so a batch leaves as one contiguous
+//      run of that channel's packets (FIFO 2 packets aside).
+//   3. Otherwise the requesting channel's batching FIFO: MWr FIFO (0/1) first,
+//      else the dedicated MRd FIFO (3/4).  A FIFO requests while it has a drain
+//      pending (triggered, snapshot not yet out), or when a pass-through beat
+//      is stalled behind it on the same channel and it must be emptied first
+//      to honour PCIe ordering (the flush request releases the ch_bar_ok
+//      barrier in the ready logic; a flush grant holds until the FIFO is
+//      empty).  Tie-breaking between the two channels is round-robin: when
+//      both request, the channel that did NOT receive the last grant
+//      (r_rr_last) wins, so under contention the channels alternate drains.
 //
-// All three trigger kinds are equal reasons to drain, so none of them gets
-// precedence over the others here; the drain latch is what makes a triggered
-// FIFO keep winning until it is empty.
+// The triggers only decide ELIGIBILITY; none of them (and no channel) gets
+// precedence in the tie-break.  In particular the timeout must not: its counter
+// saturates and stays asserted for as long as the FIFO is non-empty, so under
+// sustained load both channels sit "timed out" permanently and any rule keyed on
+// it collapses to a fixed priority.  (The previous "any timeout → ch1 wins" rule
+// did exactly that, starving ch0 whenever both channels were backlogged.)
 //
-// Combinatorial; uses r_wait_0/r_wait_1 and the registered priority/drain state.
+// Combinatorial; uses r_rr_last, r_batch_open and the registered drain state.
 // -----------------------------------------------------------------------------
 // Flush request, per batching FIFO: a pass-through beat on that channel is
 // blocked by the ordering barrier until THIS FIFO drains.  It is deliberately
@@ -1296,19 +1408,41 @@ wire f4_flush_req = ch1_pres_pass && f4_pending;
 // The interlock is on the SERVE side, not admission, so MRd is never
 // back-pressured at the input and can never head-of-line block the MWr stream
 // behind it.  It costs some MRd latency (a queued read also waits for MWr that
-// arrived after it), and it cannot deadlock: the MWr FIFO's own timeout trigger
-// always eventually drains it, releasing the MRd FIFO.
+// arrived after it).  It cannot deadlock, since the MWr FIFO empties whenever
+// MWr input on that channel pauses, but it can starve: under sustained MWr input
+// the MWr FIFO may never be empty, and that channel's reads wait until it is.
 //
 // If this design's ordering model permits a read to pass a write, delete the
 // two ch_mrd_ord_ok terms from trig_3/trig_4 and reads will batch fully
 // independently of writes.
+//
+// TODO(MRd dedicated FIFO): the interlock is all-or-nothing on the MWr FIFO
+// being empty.  With snapshot drains, MWr that arrive during a drain stay behind
+// as the next batch, so under sustained MWr input FIFO 0/1 is almost never empty
+// and that channel's reads can wait indefinitely.  Proper fix: stamp each MRd at
+// admission with the running count of MWr packets admitted on its channel, and
+// let FIFO 3/4 serve it once the running count of MWr packets read out has
+// reached its stamp (exactly the MWr that were ahead of it).  Not needed while
+// MRD_DEDICATED_FIFO = 0, the default and the only configuration in use.
 wire ch0_mrd_ord_ok = !f0_pending;
 wire ch1_mrd_ord_ok = !f1_pending;
 
-wire trig_0 = r_drain_0 || (|priority_0) || f0_flush_req;
-wire trig_1 = r_drain_1 || (|priority_1) || f1_flush_req;
-wire trig_3 = (r_drain_3 || (|priority_3) || f3_flush_req) && ch0_mrd_ord_ok;
-wire trig_4 = (r_drain_4 || (|priority_4) || f4_flush_req) && ch1_mrd_ord_ok;
+// Drain request.  The FSM always finishes a packet it has started, so once the
+// last snapshot packet is on the wire (or presented, waiting for tready) the
+// drain has nothing left to ask for.  Withdrawing it then stops the arbitration
+// at that packet's EOP (which still sees r_drain_x high) from granting the FIFO
+// one packet past the snapshot, and releases the batch hold.  Until that
+// packet's first beat is visible the request stays up, so a hold that is waiting
+// out FWFT latency keeps the grant rather than losing the end of its drain.
+wire drain_req_0 = r_drain_0 && !(r_snap_vld_0 && (r_snap_0 == 1) && (r_mst_state == MST_SERVE_0) && (r_in_pkt || !empty_0));
+wire drain_req_1 = r_drain_1 && !(r_snap_vld_1 && (r_snap_1 == 1) && (r_mst_state == MST_SERVE_1) && (r_in_pkt || !empty_1));
+wire drain_req_3 = r_drain_3 && !(r_snap_vld_3 && (r_snap_3 == 1) && (r_mst_state == MST_SERVE_3) && (r_in_pkt || !empty_3));
+wire drain_req_4 = r_drain_4 && !(r_snap_vld_4 && (r_snap_4 == 1) && (r_mst_state == MST_SERVE_4) && (r_in_pkt || !empty_4));
+
+wire trig_0 = drain_req_0 || f0_flush_req;
+wire trig_1 = drain_req_1 || f1_flush_req;
+wire trig_3 = (drain_req_3 || f3_flush_req) && ch0_mrd_ord_ok;
+wire trig_4 = (drain_req_4 || f4_flush_req) && ch1_mrd_ord_ok;
 
 // Per-channel candidate: the MWr FIFO outranks the MRd FIFO (and by the
 // interlock above the two can never both be requesting anyway).
@@ -1317,20 +1451,21 @@ wire       ch1_req = trig_1 || trig_4;
 wire [2:0] ch0_src = trig_0 ? MST_SERVE_0 : MST_SERVE_3;
 wire [2:0] ch1_src = trig_1 ? MST_SERVE_1 : MST_SERVE_4;
 
-// Timeout flag of whichever FIFO that channel is presenting.
-wire ch0_sel_to = trig_0 ? priority_0[0] : priority_3[0];
-wire ch1_sel_to = trig_1 ? priority_1[0] : priority_4[0];
+// Batch hold.  r_batch_open is set when a channel is granted and stays set while
+// that channel (r_rr_last) keeps requesting, i.e. until its snapshot is out, or
+// for an ordering flush until its FIFO is empty.
+reg        r_batch_open;
+wire       own_req = r_rr_last ? ch1_req : ch0_req;
+wire [2:0] own_src = r_rr_last ? ch1_src : ch0_src;
 
 reg [2:0] arb_src;
 always @(*) begin
     if (!empty_2) begin
         arb_src = MST_SERVE_2;              // FIFO 2 interleave takes precedence
-    end else if (ch0_req && ch1_req) begin  // both channels requesting — tie-break
-        if (ch0_sel_to || ch1_sel_to)
-            arb_src = ch1_src;              // any timeout event → channel 1 wins
-        else
-            // Serve the channel that has been waiting longer
-            arb_src = (r_wait_0 >= r_wait_1) ? ch0_src : ch1_src;
+    end else if (r_batch_open && own_req) begin
+        arb_src = own_src;                  // batch hold: finish the granted drain
+    end else if (ch0_req && ch1_req) begin  // both channels requesting — round-robin
+        arb_src = r_rr_last ? ch0_src : ch1_src;
     end else if (ch1_req) begin
         arb_src = ch1_src;
     end else if (ch0_req) begin
@@ -1340,6 +1475,15 @@ always @(*) begin
     end
 end
 
+// The FSM loads arb_src this cycle: in IDLE, or at a packet boundary of a SERVE
+// state (see the state machine below for why the drained-FIFO escape is needed).
+wire mst_rearb = (r_mst_state == MST_IDLE) || (cur_fire && cur_tlast) || (cur_empty && !r_in_pkt);
+
+assign grant_0 = mst_rearb && (arb_src == MST_SERVE_0);
+assign grant_1 = mst_rearb && (arb_src == MST_SERVE_1);
+assign grant_3 = mst_rearb && (arb_src == MST_SERVE_3);
+assign grant_4 = mst_rearb && (arb_src == MST_SERVE_4);
+
 // =================================================================
 // Master Interface State Machine
 //
@@ -1348,16 +1492,19 @@ end
 //    packet's EOP is accepted by the downstream (m_axis_tready).
 //  • All source FIFOs are mutually exclusive: none can start while
 //    another is mid-packet.
+//  • A grant to a batching FIFO lasts for its whole drain (batch
+//    hold, see the arbitration section): the other channel cannot
+//    start until the granted snapshot is out.
 //  • FIFO 2 is re-checked at every packet boundary; a FIFO 2 packet
 //    can be injected between any two consecutive batched packets.
 //  • IDLE: re-arbitrates every cycle until a source becomes available.
 // =================================================================
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        r_mst_state <= MST_IDLE;
-        r_wait_0    <= 8'd0;
-        r_wait_1    <= 8'd0;
-        r_in_pkt    <= 1'b0;
+        r_mst_state  <= MST_IDLE;
+        r_rr_last    <= 1'b1;   // ch0 takes the first contended grant
+        r_batch_open <= 1'b0;
+        r_in_pkt     <= 1'b0;
     end else begin
 
         // ----------------------------------------------------------
@@ -1369,21 +1516,16 @@ always @(posedge clk or negedge rst_n) begin
             r_in_pkt <= ~cur_tlast;
 
         // ----------------------------------------------------------
-        // Aging counters — per channel, covering both of that
-        // channel's batching FIFOs.
-        //   Clear while actively serving either of them.
-        //   Increment (up to 8'hFF) whenever the channel is
-        //   requesting but is not currently being served.
+        // Round-robin pointer and batch hold — per channel, covering
+        // both of that channel's batching FIFOs.  Updated on grant (not
+        // on EOP), so the arbitration at the end of a packet already
+        // sees that packet's channel as the owner.  The hold drops as
+        // soon as the owner stops requesting (its last snapshot packet
+        // is on the wire); FIFO 2 grants leave both unchanged.
         // ----------------------------------------------------------
-        if ((r_mst_state == MST_SERVE_0) || (r_mst_state == MST_SERVE_3))
-            r_wait_0 <= 8'd0;
-        else if (ch0_req && r_wait_0 < 8'hFF)
-            r_wait_0 <= r_wait_0 + 1'b1;
-
-        if ((r_mst_state == MST_SERVE_1) || (r_mst_state == MST_SERVE_4))
-            r_wait_1 <= 8'd0;
-        else if (ch1_req && r_wait_1 < 8'hFF)
-            r_wait_1 <= r_wait_1 + 1'b1;
+        if      (grant_0 || grant_3) begin r_rr_last <= 1'b0; r_batch_open <= 1'b1; end
+        else if (grant_1 || grant_4) begin r_rr_last <= 1'b1; r_batch_open <= 1'b1; end
+        else if (!own_req)                 r_batch_open <= 1'b0;
 
         // ----------------------------------------------------------
         // State transitions — occur only at packet boundaries
@@ -1414,7 +1556,7 @@ always @(posedge clk or negedge rst_n) begin
                 // waiting for an EOP beat that can never arrive, dead-
                 // locking the whole switch.  r_in_pkt==0 guarantees we
                 // only leave at a true packet boundary, never mid-packet.
-                if ((cur_fire && cur_tlast) || (cur_empty && !r_in_pkt))
+                if (mst_rearb)
                     r_mst_state <= arb_src;
             end
 
