@@ -18,6 +18,7 @@ reg                           rst_n;
 reg  [TIME_FEDILITY-1:0]      time_threshold;
 reg  [DEPTH_FEDILITY-1:0]     depth_threshold;
 reg                           batch_mrd;
+reg                           drain_depth_cap;
 
 reg  [AXIS_DATA_WIDTH-1:0]    s_axis_tdata_0;
 reg  [AXIS_DATA_WIDTH/32-1:0] s_axis_tkeep_0;   // PG343: tkeep is per-DWORD
@@ -49,6 +50,7 @@ axi4_mwr_batch dut (
 	.time_threshold        (time_threshold),
 	.depth_threshold       (depth_threshold),
 	.batch_mrd             (batch_mrd),
+	.drain_depth_cap       (drain_depth_cap),
 
 	.s_axis_tdata_0        (s_axis_tdata_0),
 	.s_axis_tkeep_0        (s_axis_tkeep_0),
@@ -78,6 +80,9 @@ axi4_mwr_batch dut (
 initial clk = 1'b0;
 always #5 clk = ~clk;
 
+int plus_depth;
+int drain_mode;
+
 task automatic reset_dut;
 begin
 	rst_n          = 1'b0;
@@ -86,9 +91,16 @@ begin
 	// FIFO), not per-beat.  With 1..12-beat packets, 10 beats used to be ~1
 	// packet; 4 packets keeps the depth trigger reachable under this stimulus.
 	depth_threshold= 8'd4;
+	if ($value$plusargs("DEPTH=%d", plus_depth))
+		depth_threshold = plus_depth[DEPTH_FEDILITY-1:0];
 	// MRd batching off by default here, so MRd keeps taking the FIFO-2
 	// pass-through path this testbench's checks were written against.
 	batch_mrd      = 1'b0;
+	// Drain size: +DRAIN_MODE=0 whole snapshot, 1 depth cap, 2 (default) toggle
+	// between the two at random while traffic runs (see the mode toggler).
+	if (!$value$plusargs("DRAIN_MODE=%d", drain_mode))
+		drain_mode = 2;
+	drain_depth_cap = (drain_mode == 1);
 
 	s_axis_tdata_0 = '0;
 	s_axis_tkeep_0 = '0;
@@ -373,6 +385,75 @@ always @(posedge clk) begin
 		collect_output_beat();
 end
 
+// -----------------------------------------------------------------------------
+// Drain-size monitor (white-box, batching FIFOs 0 and 1).
+//
+// A drain episode runs from the snapshot latch (r_snap_vld_x rising) to its
+// release.  Every EOP read out of the FIFO in between is one packet of that
+// drain.  In depth-cap mode an episode must not send more than
+// max(depth_threshold, 1) packets.  The mode and depth are the values in force
+// at the grant, i.e. sampled on the edge that latched the snapshot.
+// drain_depth_cap only changes on negedge, so these samples are race-free.
+// -----------------------------------------------------------------------------
+int drain_errors;
+int ep_cnt     [2][2];   // [fifo][mode] drain episodes
+int ep_at_cap  [2][2];   // [fifo][mode] episodes that sent exactly the cap
+int ep_over_cap[2][2];   // [fifo][mode] episodes that sent more than the cap
+int ep_max     [2][2];   // [fifo][mode] largest episode, packets
+
+bit dm_vld_q  [2];       // r_snap_vld_x on the previous edge
+bit dm_mode_q [2];       // drain_depth_cap on the previous edge
+int dm_depth_q[2];       // depth_threshold on the previous edge
+bit dm_mode   [2];       // open episode: mode at its grant
+int dm_cap    [2];       // open episode: cap at its grant
+int dm_pkts   [2];       // open episode: packets sent so far
+
+task automatic drain_monitor_step(input int f, input bit snap_vld, input bit rd_eop);
+begin
+	if (snap_vld && !dm_vld_q[f]) begin
+		dm_mode[f] = dm_mode_q[f];
+		dm_cap[f]  = (dm_depth_q[f] == 0) ? 1 : dm_depth_q[f];
+		dm_pkts[f] = 0;
+	end
+	if (snap_vld && rd_eop)
+		dm_pkts[f] = dm_pkts[f] + 1;
+	if (!snap_vld && dm_vld_q[f]) begin
+		ep_cnt[f][dm_mode[f]] = ep_cnt[f][dm_mode[f]] + 1;
+		if (dm_pkts[f] == dm_cap[f]) ep_at_cap[f][dm_mode[f]]   = ep_at_cap[f][dm_mode[f]] + 1;
+		if (dm_pkts[f] >  dm_cap[f]) ep_over_cap[f][dm_mode[f]] = ep_over_cap[f][dm_mode[f]] + 1;
+		if (dm_pkts[f] > ep_max[f][dm_mode[f]]) ep_max[f][dm_mode[f]] = dm_pkts[f];
+		if (dm_mode[f] && (dm_pkts[f] > dm_cap[f])) begin
+			drain_errors = drain_errors + 1;
+			$error("DRAIN: FIFO %0d depth-cap drain sent %0d packets, cap %0d",
+				   f, dm_pkts[f], dm_cap[f]);
+		end
+	end
+	dm_vld_q[f]   = snap_vld;
+	dm_mode_q[f]  = drain_depth_cap;
+	dm_depth_q[f] = depth_threshold;
+end
+endtask
+
+always @(posedge clk) begin
+	if (rst_n) begin
+		drain_monitor_step(0, dut.r_snap_vld_0, dut.rd_en_0 && dut.cur_tlast);
+		drain_monitor_step(1, dut.r_snap_vld_1, dut.rd_en_1 && dut.cur_tlast);
+	end
+end
+
+// Runtime mode switch: with +DRAIN_MODE=2, flip drain_depth_cap every 20..400
+// cycles while traffic runs, on negedge so the flips land at arbitrary points
+// of the trigger/grant/drain sequence.
+initial begin
+	wait (rst_n === 1'b1);
+	if (drain_mode == 2) begin
+		while (!traffic_done) begin
+			repeat ($urandom_range(20, 400)) @(negedge clk);
+			drain_depth_cap = ~drain_depth_cap;
+		end
+	end
+end
+
 task automatic report_results;
 	longint unsigned id;
 	int missing;
@@ -419,14 +500,21 @@ begin
 	$display("observed output beats : %0d", total_observed_beats);
 	$display("completed packets     : %0d", total_completed);
 	$display("framing errors        : %0d", framing_errors);
+	$display("drain-size errors     : %0d", drain_errors);
+	$display("drain mode / depth    : %0d / %0d", drain_mode, depth_threshold);
+	for (int f = 0; f < 2; f++)
+		for (int m = 0; m < 2; m++)
+			$display("  FIFO %0d %s drains=%5d  max=%3d pkts  at-cap=%5d  over-cap=%5d",
+				f, m ? "depth-cap" : "snapshot ", ep_cnt[f][m], ep_max[f][m],
+				ep_at_cap[f][m], ep_over_cap[f][m]);
 	$display("======================================================\n");
 
 	if ((missing == 0) && (incomplete == 0) && (total_unknown_packets == 0) &&
-		(framing_errors == 0))
+		(framing_errors == 0) && (drain_errors == 0))
 		$display("TEST PASS");
 	else
-		$error("TEST FAIL: missing=%0d incomplete=%0d unknown=%0d framing=%0d",
-			   missing, incomplete, total_unknown_packets, framing_errors);
+		$error("TEST FAIL: missing=%0d incomplete=%0d unknown=%0d framing=%0d drain=%0d",
+			   missing, incomplete, total_unknown_packets, framing_errors, drain_errors);
 end
 endtask
 
@@ -443,6 +531,7 @@ initial begin
 	out_in_flight        = 1'b0;
 	out_cur_id           = '0;
 	framing_errors       = 0;
+	drain_errors         = 0;
 	traffic_done         = 1'b0;
 
 	reset_dut();

@@ -39,6 +39,13 @@ module axi4_mwr_batch #(
     // path they were admitted on, and the ordering barriers below account for
     // MRd sitting in either the batching FIFOs or FIFO 2 after a toggle.
     input wire                                  batch_mrd,
+    // Runtime drain-size select: how many packets one drain grant sends.
+    //   0 = snapshot : every packet in the FIFO at the grant
+    //   1 = depth cap: up to depth_threshold packets (at least one), or until
+    //                  the FIFO runs out, whichever comes first
+    // Sampled at the grant, so it is safe to change at any time: a drain in
+    // progress finishes with the size it was granted.  See DRAIN state below.
+    input wire                                  drain_depth_cap,
 
     // AXX4 Slave AXIS interface 0
     input  wire [AXIS_DATA_WIDTH-1:0]    s_axis_tdata_0,
@@ -1108,6 +1115,22 @@ wire to_active_4 = !empty_4 && (r_to_cnt_4 >= time_threshold);
 // FIFO's worth), then the round-robin pointer hands it to the other channel if
 // that one is waiting.  FIFO 2 keeps its interleave precedence at every packet
 // boundary, including inside a drain.
+//
+// Depth-cap mode (drain_depth_cap = 1): the snapshot is clipped to
+// depth_threshold packets, so a grant sends at most depth_threshold packets —
+// the oldest ones — and fewer if the FIFO holds fewer.  This bounds how long one
+// channel holds the master interface to one depth's worth instead of one
+// FIFO's worth.  Whatever is left over stays behind as the next batch, exactly
+// like packets that arrive after the grant.  The cap is floored at one packet,
+// so depth_threshold = 0 still makes progress (one packet per grant, matching
+// the depth trigger, which at 0 fires on any one whole packet).
+//
+// Clipping never strands the partial packet the snapshot rule above protects.
+// When the cap actually clips, it is below snap_now, so every packet it covers
+// is complete and the partial one is left at the tail.  It reaches the head
+// after later drains, and the snapshot that covers it streams it cut-through
+// as before.  An ordering flush (fx_flush_req) is not clipped either: it keeps
+// the FIFO granted until it is empty, whatever the drain size.
 // -----------------------------------------------------------------------------
 reg                  r_drain_0,    r_drain_1,    r_drain_3,    r_drain_4;
 reg                  r_snap_vld_0, r_snap_vld_1, r_snap_vld_3, r_snap_vld_4;  // granted: snapshot latched
@@ -1127,6 +1150,22 @@ wire [FIFO_CNT_W-1:0] snap_now_3 = r_pkt_cnt_3 + (wr_eop_3 ? 1'b1 : 1'b0) - (rd_
                                                + ((r_beat_cnt_3 != 0) ? 1'b1 : 1'b0);
 wire [FIFO_CNT_W-1:0] snap_now_4 = r_pkt_cnt_4 + (wr_eop_4 ? 1'b1 : 1'b0) - (rd_eop_4 ? 1'b1 : 1'b0)
                                                + ((r_beat_cnt_4 != 0) ? 1'b1 : 1'b0);
+
+// Drain size latched at the grant: snap_now_x whole, or in depth-cap mode
+// clipped to depth_threshold (floored at 1).  The compares run at DEPTH_CMP_W,
+// like the depth trigger.  The clipped value is below snap_now_x, so it always
+// fits back into FIFO_CNT_W.
+wire [DEPTH_CMP_W-1:0] drain_cap_ext = (depth_thr_ext != 0) ? depth_thr_ext
+                                                            : {{(DEPTH_CMP_W-1){1'b0}}, 1'b1};
+
+wire [FIFO_CNT_W-1:0] snap_take_0 = (drain_depth_cap && (snap_now_0 > drain_cap_ext))
+                                  ? drain_cap_ext[FIFO_CNT_W-1:0] : snap_now_0;
+wire [FIFO_CNT_W-1:0] snap_take_1 = (drain_depth_cap && (snap_now_1 > drain_cap_ext))
+                                  ? drain_cap_ext[FIFO_CNT_W-1:0] : snap_now_1;
+wire [FIFO_CNT_W-1:0] snap_take_3 = (drain_depth_cap && (snap_now_3 > drain_cap_ext))
+                                  ? drain_cap_ext[FIFO_CNT_W-1:0] : snap_now_3;
+wire [FIFO_CNT_W-1:0] snap_take_4 = (drain_depth_cap && (snap_now_4 > drain_cap_ext))
+                                  ? drain_cap_ext[FIFO_CNT_W-1:0] : snap_now_4;
 
 // Drain request: a trigger flag is up and there is something to drain.
 wire drain_go_0 = !r_drain_0 && (|priority_0) && (snap_now_0 != 0);
@@ -1311,7 +1350,7 @@ always @(posedge clk or negedge rst_n) begin
                 if (rd_eop_0)                  r_snap_0  <= r_snap_0 - 1'b1;
             end else if (r_drain_0 && grant_0) begin
                 r_snap_vld_0 <= 1'b1;
-                r_snap_0     <= snap_now_0;
+                r_snap_0     <= snap_take_0;
             end
         end
 
@@ -1324,7 +1363,7 @@ always @(posedge clk or negedge rst_n) begin
                 if (rd_eop_1)                  r_snap_1  <= r_snap_1 - 1'b1;
             end else if (r_drain_1 && grant_1) begin
                 r_snap_vld_1 <= 1'b1;
-                r_snap_1     <= snap_now_1;
+                r_snap_1     <= snap_take_1;
             end
         end
 
@@ -1337,7 +1376,7 @@ always @(posedge clk or negedge rst_n) begin
                 if (rd_eop_3)                  r_snap_3  <= r_snap_3 - 1'b1;
             end else if (r_drain_3 && grant_3) begin
                 r_snap_vld_3 <= 1'b1;
-                r_snap_3     <= snap_now_3;
+                r_snap_3     <= snap_take_3;
             end
         end
 
@@ -1350,7 +1389,7 @@ always @(posedge clk or negedge rst_n) begin
                 if (rd_eop_4)                  r_snap_4  <= r_snap_4 - 1'b1;
             end else if (r_drain_4 && grant_4) begin
                 r_snap_vld_4 <= 1'b1;
-                r_snap_4     <= snap_now_4;
+                r_snap_4     <= snap_take_4;
             end
         end
 

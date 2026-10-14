@@ -85,7 +85,7 @@ module tel_top_harness #(
         .LOG_FIFO_DEPTH   (LOG_FIFO)
     ) dut (
         .clk (clk), .rst_n (rst_n),
-        .time_threshold (8'd6), .depth_threshold (8'd4), .batch_mrd (1'b0),
+        .time_threshold (8'd6), .depth_threshold (8'd4), .batch_mrd (1'b0), .drain_depth_cap (1'b0),
         .s_axis_tdata_0 (tdata_0), .s_axis_tkeep_0 ({(DW/32){1'b1}}), .s_axis_tvalid_0 (tvalid_0),
         .s_axis_tlast_0 (tlast_0), .s_axis_tuser_0 (tuser_0), .s_axis_tready_0 (tready_0),
         .s_axis_tdata_1 (tdata_1), .s_axis_tkeep_1 ({(DW/32){1'b1}}), .s_axis_tvalid_1 (tvalid_1),
@@ -386,7 +386,7 @@ module telemetry_dma_tb;
     wire        ila_log_tvalid, ila_log_busy;
     wire [1:0]  ila_log_reason;
     axi4_mwr_batch_top #(.ENABLE_ILA(0), .DMA_LOG(0)) u_top_ila (
-        .clk(clk), .rst_n(rst_n), .time_threshold(8'd6), .depth_threshold(8'd4), .batch_mrd(1'b0),
+        .clk(clk), .rst_n(rst_n), .time_threshold(8'd6), .depth_threshold(8'd4), .batch_mrd(1'b0), .drain_depth_cap(1'b0),
         .s_axis_tdata_0(tdata_0), .s_axis_tkeep_0('1), .s_axis_tvalid_0(tvalid_0), .s_axis_tlast_0(tlast_0),
         .s_axis_tuser_0(tuser_0), .s_axis_tready_0(),
         .s_axis_tdata_1(tdata_1), .s_axis_tkeep_1('1), .s_axis_tvalid_1(tvalid_1), .s_axis_tlast_1(tlast_1),

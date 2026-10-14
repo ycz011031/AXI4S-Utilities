@@ -56,6 +56,9 @@ module axi4_mwr_batch_top #(
     input  wire [DEPTH_FEDILITY-1:0]     depth_threshold,
     // Runtime enable for MRd batching (forwarded to axi4_mwr_batch).
     input  wire                          batch_mrd,
+    // Runtime drain size (forwarded to axi4_mwr_batch):
+    // 0 = whole snapshot, 1 = at most depth_threshold packets per grant.
+    input  wire                          drain_depth_cap,
 
     // -------- Slave input port 0 (RQ) --------
     input  wire [AXIS_DATA_WIDTH-1:0]    s_axis_tdata_0,
@@ -203,6 +206,7 @@ module axi4_mwr_batch_top #(
         .time_threshold  (time_threshold),
         .depth_threshold (depth_threshold),
         .batch_mrd       (batch_mrd),
+        .drain_depth_cap (drain_depth_cap),
         // slave 0 <- telemetry 0
         .s_axis_tdata_0  (tel0_tdata),
         .s_axis_tkeep_0  (tel0_tkeep),
