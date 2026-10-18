@@ -20,11 +20,16 @@
 //
 //   DMA_LOG = 0 : the two input taps play their records back into their own
 //                 ILA (ENABLE_ILA).  The log_* / m_axis_log_* ports are inert.
-//   DMA_LOG = 1 : a third tap (u_telemetry_out) snoops the batched output, and
-//                 u_logger merges all three into ONE stream, m_axis_log_*, for an
-//                 external AXI DMA (S2MM).  Each record is tagged with its port:
-//                   port 0 = in0, port 1 = in1, port 2 = out.
-//                 One log_enable arms all three; one status set reports.
+//   DMA_LOG = 1 : only the batched output is logged, once per TLP.  A tap
+//                 (u_telemetry_out) snoops the output, and u_logger streams its
+//                 records, m_axis_log_*, to an external AXI DMA (S2MM).  The
+//                 input taps are plain passthroughs.  The batcher stamps every
+//                 packet on entry (INGRESS_TS), so each record also carries:
+//                   pkt_wait : cycles from the packet's input SOP to its output
+//                              SOP (time spent in the batcher), saturating
+//                   port     : the input it came from, 0 = in0, 1 = in1
+//                 Input SOP = output SOP - pkt_wait, so the input timeline is
+//                 recovered from the output records without logging twice.
 //                 Record format: telemetry_dma_format.md.
 // =================================================================
 module axi4_mwr_batch_top #(
@@ -42,8 +47,8 @@ module axi4_mwr_batch_top #(
     parameter integer ILA_DEPTH        = 0,
     parameter         ENABLE_ILA       = 1,             // per-port ILA in each telemetry block (DMA_LOG = 0)
     // --- DMA logging (axi4_telemetry_logger, DMA_LOG = 1) ---
-    parameter         DMA_LOG          = 0,             // 1 = log all three ports to DDR via external AXI DMA
-    parameter integer DMA_REGION_BYTES = 1048576,       // DDR region size, bytes (one region for all ports)
+    parameter         DMA_LOG          = 0,             // 1 = log the output port to DDR via external AXI DMA
+    parameter integer DMA_REGION_BYTES = 1048576,       // DDR region size, bytes
     parameter integer LOG_TDATA_WIDTH  = 128,           // m_axis_log tdata width
     parameter integer LOG_FIFO_DEPTH   = 512            // logger FIFO depth, entries (cycles with a TLP end)
 )(
@@ -115,10 +120,8 @@ module axi4_mwr_batch_top #(
     wire                          bat_tlast;
     wire [AXIS_TUSER_WIDTH-1:0]   bat_tuser;
     wire                          bat_tready;
-
-    // Record taps: port 0 = in0, 1 = in1, 2 = out
-    wire [2:0]                    tap_valid;
-    wire [3*112-1:0]              tap_data;
+    wire                          bat_src;     // input the presented beat came from
+    wire [15:0]                   bat_wait;    // cycles since it was accepted there
 
     // =============================================================
     // Port 0 telemetry passthrough (RQ)
@@ -149,9 +152,12 @@ module axi4_mwr_batch_top #(
         .m_axis_tlast  (tel0_tlast),
         .m_axis_tuser  (tel0_tuser),
         .m_axis_tready (tel0_tready),
-        // record tap
-        .log_rec_valid (tap_valid[0]),
-        .log_rec_data  (tap_data[0*112 +: 112])
+        // no sideband; record tap unused (only the output is logged)
+        .s_axis_wait   (16'd0),
+        .s_axis_src    (2'd0),
+        .log_rec_valid (),
+        .log_rec_data  (),
+        .log_rec_src   ()
     );
 
     // =============================================================
@@ -183,9 +189,12 @@ module axi4_mwr_batch_top #(
         .m_axis_tlast  (tel1_tlast),
         .m_axis_tuser  (tel1_tuser),
         .m_axis_tready (tel1_tready),
-        // record tap
-        .log_rec_valid (tap_valid[1]),
-        .log_rec_data  (tap_data[1*112 +: 112])
+        // no sideband; record tap unused (only the output is logged)
+        .s_axis_wait   (16'd0),
+        .s_axis_src    (2'd0),
+        .log_rec_valid (),
+        .log_rec_data  (),
+        .log_rec_src   ()
     );
 
     // =============================================================
@@ -199,6 +208,7 @@ module axi4_mwr_batch_top #(
         .DEPTH_FEDILITY   (DEPTH_FEDILITY),
         .MAX_PKT_BEATS    (MAX_PKT_BEATS),
         .MRD_DEDICATED_FIFO (MRD_DEDICATED_FIFO),
+        .INGRESS_TS       (DMA_LOG),                    // stamp packets only when logging
         .IF_TYPE          ("RQ")
     ) u_mwr_batch (
         .clk             (clk),
@@ -227,14 +237,22 @@ module axi4_mwr_batch_top #(
         .m_axis_tvalid   (bat_tvalid),
         .m_axis_tlast    (bat_tlast),
         .m_axis_tuser    (bat_tuser),
-        .m_axis_tready   (bat_tready)
+        .m_axis_tready   (bat_tready),
+        .m_axis_src      (bat_src),
+        .m_axis_wait     (bat_wait)
     );
 
     generate
     if (DMA_LOG == 1) begin : gen_dma_log
 
+        // Output record tap
+        wire         out_rec_valid;
+        wire [119:0] out_rec_data;
+        wire [1:0]   out_rec_src;
+
         // =========================================================
-        // Output-port telemetry tap (RQ) — passthrough on the batched stream
+        // Output-port telemetry tap (RQ) — passthrough on the batched stream.
+        // pkt_wait and the source input come from the batcher's stamp.
         // =========================================================
         axi4_telemetry #(
             .AXIS_DATA_WIDTH  (AXIS_DATA_WIDTH),
@@ -262,24 +280,31 @@ module axi4_mwr_batch_top #(
             .m_axis_tlast  (m_axis_tlast),
             .m_axis_tuser  (m_axis_tuser),
             .m_axis_tready (m_axis_tready),
+            // batcher sideband
+            .s_axis_wait   (bat_wait),
+            .s_axis_src    ({1'b0, bat_src}),
             // record tap
-            .log_rec_valid (tap_valid[2]),
-            .log_rec_data  (tap_data[2*112 +: 112])
+            .log_rec_valid (out_rec_valid),
+            .log_rec_data  (out_rec_data),
+            .log_rec_src   (out_rec_src)
         );
 
         // =========================================================
-        // Merge the three taps into one DMA stream
+        // Output records -> one DMA stream.  Each record goes to the logger
+        // port of the input its packet came from, so the record's port field
+        // (and a dropped record's) names that input: 0 = in0, 1 = in1.
         // =========================================================
         axi4_telemetry_logger #(
-            .NUM_PORTS        (3),
+            .NUM_PORTS        (2),
             .FIFO_DEPTH       (LOG_FIFO_DEPTH),
             .DMA_REGION_BYTES (DMA_REGION_BYTES),
             .LOG_TDATA_WIDTH  (LOG_TDATA_WIDTH)
         ) u_logger (
             .clk               (clk),
             .rst_n             (rst_n),
-            .rec_valid         (tap_valid),
-            .rec_data          (tap_data),
+            .rec_valid         ({out_rec_valid && (out_rec_src == 2'd1),
+                                 out_rec_valid && (out_rec_src == 2'd0)}),
+            .rec_data          ({2{out_rec_data}}),
             .log_enable        (log_enable),
             .log_busy          (log_busy),
             .log_done          (log_done),
@@ -302,9 +327,6 @@ module axi4_mwr_batch_top #(
         assign m_axis_tlast      = bat_tlast;
         assign m_axis_tuser      = bat_tuser;
         assign bat_tready        = m_axis_tready;
-
-        assign tap_valid[2]      = 1'b0;
-        assign tap_data[2*112 +: 112] = 112'd0;
 
         assign log_busy          = 1'b0;
         assign log_done          = 1'b0;

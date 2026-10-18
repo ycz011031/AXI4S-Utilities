@@ -6,9 +6,13 @@
 // into a single DDR region.  Record format: telemetry_dma_format.md.
 //
 // Every 16-byte record carries an info byte (byte 14) naming its source port
-// and kind (TLP / dropped TLP / trailer / pad).  Records appear in DDR in EOP
-// time order across all ports; TLPs that end in the same cycle are ordered by
-// port index.
+// and kind (TLP / dropped TLP / trailer / pad).  A tap supplies the other 15
+// bytes (0..13 and 15).  Records appear in DDR in EOP time order across all
+// ports; TLPs that end in the same cycle are ordered by port index.
+//
+// A "port" is just a rec_valid/rec_data slice.  axi4_mwr_batch_top feeds both
+// slices from its one output tap, steering each record by the input the packet
+// came from, so the port id names that input.
 //
 //   taps -> claim -> xpm_fifo_sync (one entry per cycle) -> expander -> beat packer -> m_axis_log
 //
@@ -28,7 +32,7 @@
 // DMA_REGION_BYTES and always ends with tlast: the DMA closes the transfer and
 // nothing beyond the region, or already written, is overwritten.
 //
-// FIFO entry = {final, vmask[P], zcnt[P][CW], rec[P][112]}.  For each port p
+// FIFO entry = {final, vmask[P], zcnt[P][CW], rec[P][120]}.  For each port p
 // in order: emit zcnt[p] dropped-TLP records, then rec[p] if vmask[p].
 // Carrying the owed-drop counts in the next entry that fits keeps drops in
 // their original per-port position with one FIFO write per cycle at most.
@@ -42,9 +46,10 @@ module axi4_telemetry_logger #(
     input  wire                          clk,
     input  wire                          rst_n,
 
-    // Record taps from axi4_telemetry (port p = bit/slice p)
+    // Record taps from axi4_telemetry (port p = bit/slice p).  Each slice is
+    // record bytes {15, 13..0}; the logger inserts byte 14 (info).
     input  wire [NUM_PORTS-1:0]          rec_valid,
-    input  wire [NUM_PORTS*112-1:0]      rec_data,
+    input  wire [NUM_PORTS*120-1:0]      rec_data,
 
     // Control / status.  log_enable is synchronised internally.
     input  wire                          log_enable,
@@ -67,7 +72,8 @@ module axi4_telemetry_logger #(
 // =================================================================
 localparam integer P          = NUM_PORTS;
 localparam integer REC_BITS   = 128;
-localparam integer DATA_BITS  = 112;                              // record bytes 0..13
+localparam integer DATA_BITS  = 120;                              // record bytes {15, 13..0}
+localparam integer LO_BITS    = 112;                              // bytes 0..13, below the info byte
 localparam integer K          = LOG_TDATA_WIDTH / REC_BITS;       // records per beat
 localparam integer N          = DMA_REGION_BYTES / (REC_BITS/8);  // record slots in region
 localparam integer CAP        = N - 1;                            // slots for TLP records (1 kept for trailer)
@@ -360,7 +366,7 @@ wire [KW-1:0] pad_cnt = (K - 1) - (r_slots % K);
 
 assign fifo_rd_en = head_pop;
 
-wire [DATA_BITS-1:0] trailer_data = {
+wire [LO_BITS-1:0] trailer_data = {
     8'd0,                               // byte  13      reserved
     {6'd0, r_stop_reason},              // byte  12      stop_reason
     r_duration,                         // bytes 8..11   duration_cycles
@@ -368,17 +374,19 @@ wire [DATA_BITS-1:0] trailer_data = {
     {{(32-CW){1'b0}}, r_slots}          // bytes 0..3    n_records (TLP + dropped)
 };
 
+wire [DATA_BITS-1:0] head_rec = fifo_dout[sel*DATA_BITS +: DATA_BITS];
+
 reg [REC_BITS-1:0] emit_rec;
 always @(*) begin
     if (r_tail) begin
         if (r_tail_pad != {KW{1'b0}})
-            emit_rec = {8'd0, info_byte(KIND_PAD, 2'd0), {DATA_BITS{1'b0}}};
+            emit_rec = {8'd0, info_byte(KIND_PAD, 2'd0), {LO_BITS{1'b0}}};
         else
             emit_rec = {8'd0, info_byte(KIND_TRAILER, 2'd0), trailer_data};
     end else if (zwork[sel]) begin
-        emit_rec = {8'd0, info_byte(KIND_DROP, sel), {DATA_BITS{1'b0}}};
+        emit_rec = {8'd0, info_byte(KIND_DROP, sel), {LO_BITS{1'b0}}};
     end else begin
-        emit_rec = {8'd0, info_byte(KIND_TLP, sel), fifo_dout[sel*DATA_BITS +: DATA_BITS]};
+        emit_rec = {head_rec[DATA_BITS-1:LO_BITS], info_byte(KIND_TLP, sel), head_rec[LO_BITS-1:0]};
     end
 end
 

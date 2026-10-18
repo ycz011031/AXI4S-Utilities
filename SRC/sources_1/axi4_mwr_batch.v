@@ -23,6 +23,11 @@ module axi4_mwr_batch #(
     //                  serve-side ordering interlock described at ch_mrd_ord_ok.
     // Ignored while batch_mrd is low (MRd then passes through FIFO 2).
     parameter integer MRD_DEDICATED_FIFO = 0,
+    // Ingress stamp for telemetry (see m_axis_src / m_axis_wait):
+    //   0 = off: FIFO entries hold the AXI-S fields only; sideband outputs tied 0.
+    //   1 = on : every FIFO entry also carries the slave port it came in on and
+    //            a 32-bit cycle stamp of its acceptance there (+33 bits/entry).
+    parameter integer INGRESS_TS = 0,
     parameter         IF_TYPE = "CQ"  // "CQ" or "RQ" — selects tuser sideband bit layout (PG343)
 )(
     input wire                          clk,
@@ -69,11 +74,20 @@ module axi4_mwr_batch #(
     output wire                          m_axis_tvalid,
     output wire                          m_axis_tlast,
     output wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser,
-    input  wire                          m_axis_tready
+    input  wire                          m_axis_tready,
+
+    // Ingress sideband (INGRESS_TS = 1; tied to 0 otherwise), qualified by
+    // m_axis_tvalid like the other master signals:
+    //   m_axis_src  : slave port the presented beat was accepted on (0 or 1)
+    //   m_axis_wait : cycles since that acceptance, saturating at 65535.  On
+    //                 the SOP beat this is the packet's wait inside this module.
+    output wire                          m_axis_src,
+    output wire [15:0]                   m_axis_wait
     //
     // NOTE: Per-packet telemetry (length, gap, type, address, tag, counts)
     // is collected externally by the axi4_telemetry passthrough module on the
-    // master stream, so this module no longer exports telemetry ports.
+    // master stream; m_axis_src / m_axis_wait are the only per-packet facts it
+    // cannot see on the bus.
     // time_threshold / depth_threshold are retained: they drive the internal
     // batching priority (timeout / packet-depth triggers) used by the arbiter,
     // alongside the parameter-seeded space trigger (see MAX_PKT_BEATS).
@@ -87,6 +101,15 @@ localparam integer FIFO_CNT_W = $clog2(FIFO_DEPTH) + 1;
 
 // tkeep is per-DWORD (PG343): width = DATA_WIDTH/32 (16 for a 512-bit bus)
 localparam integer TKEEP_WIDTH = AXIS_DATA_WIDTH/32;
+
+// FIFO entry = { [src, ts] (INGRESS_TS only), AXI-S fields (AXIS_FIFO_WIDTH) }.
+// The AXI-S fields keep their bit positions either way.  At the RQ defaults the
+// entry grows 667 -> 700 bits: 10 RAMB36 per FIFO instead of 9 RAMB36 + 1 RAMB18
+// (72-bit columns; synthesised on xcvc1902).
+localparam integer TS_W   = 32;    // ingress stamp width (wraps every 2^32 cycles)
+localparam integer WAIT_W = 16;    // m_axis_wait width
+localparam integer META_W = (INGRESS_TS != 0) ? (1 + TS_W) : 0;
+localparam integer FIFO_W = AXIS_FIFO_WIDTH + META_W;
 
 // -----------------------------------------------------------------------------
 // prog_full (almost_full) backpressure headroom.
@@ -146,8 +169,8 @@ localparam MRD_DED = (MRD_DEDICATED_FIFO != 0);
 // FIFO 0 (ch0 MWr)
 wire                         almost_full_0,  almost_empty_0;
 wire                         full_0,         empty_0;
-wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_in_0; // driven by slave-facing process (assign)
-wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_out_0;// driven by xpm_fifo_sync dout
+wire [FIFO_W-1:0]            fifo_data_in_0; // driven by slave-facing process (assign)
+wire [FIFO_W-1:0]            fifo_data_out_0;// driven by xpm_fifo_sync dout
 wire                         wr_en_0;        // driven by slave-facing process (assign)
 wire                         rd_en_0;        // driven by master interface (assign)
 wire [FIFO_CNT_W-1:0]        wr_data_count_0, rd_data_count_0;
@@ -156,8 +179,8 @@ wire                         data_valid_0;
 // FIFO 1 (ch1 MWr)
 wire                         almost_full_1,  almost_empty_1;
 wire                         full_1,         empty_1;
-wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_in_1;
-wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_out_1;
+wire [FIFO_W-1:0]            fifo_data_in_1;
+wire [FIFO_W-1:0]            fifo_data_out_1;
 wire                         wr_en_1;
 wire                         rd_en_1;
 wire [FIFO_CNT_W-1:0]        wr_data_count_1, rd_data_count_1;
@@ -166,8 +189,8 @@ wire                         data_valid_1;
 // FIFO 2 (pass-through: request types that are not batched)
 wire                         almost_full_2,  almost_empty_2;
 wire                         full_2,         empty_2;
-wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_in_2;
-wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_out_2;
+wire [FIFO_W-1:0]            fifo_data_in_2;
+wire [FIFO_W-1:0]            fifo_data_out_2;
 wire                         wr_en_2;
 wire                         rd_en_2;
 wire [FIFO_CNT_W-1:0]        wr_data_count_2, rd_data_count_2;
@@ -175,15 +198,15 @@ wire                         data_valid_2;
 
 // FIFO 3 (ch0 MRd) / FIFO 4 (ch1 MRd) — only built when MRD_DEDICATED_FIFO
 wire                         almost_full_3,  empty_3;
-wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_in_3;
-wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_out_3;
+wire [FIFO_W-1:0]            fifo_data_in_3;
+wire [FIFO_W-1:0]            fifo_data_out_3;
 wire                         wr_en_3;
 wire                         rd_en_3;
 wire [FIFO_CNT_W-1:0]        wr_data_count_3;
 
 wire                         almost_full_4,  empty_4;
-wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_in_4;
-wire [AXIS_FIFO_WIDTH-1:0]   fifo_data_out_4;
+wire [FIFO_W-1:0]            fifo_data_in_4;
+wire [FIFO_W-1:0]            fifo_data_out_4;
 wire                         wr_en_4;
 wire                         rd_en_4;
 wire [FIFO_CNT_W-1:0]        wr_data_count_4;
@@ -204,13 +227,13 @@ xpm_fifo_sync #(
     .FIFO_MEMORY_TYPE    ("bram"),
     .ECC_MODE            ("no_ecc"),
     .FIFO_WRITE_DEPTH    (FIFO_DEPTH),
-    .WRITE_DATA_WIDTH    (AXIS_FIFO_WIDTH),
+    .WRITE_DATA_WIDTH    (FIFO_W),
     .WR_DATA_COUNT_WIDTH (FIFO_CNT_W),
     .PROG_FULL_THRESH    (PROG_FULL_THRESH_C),
     .FULL_RESET_VALUE    (0),
     .READ_MODE           ("fwft"),
     .FIFO_READ_LATENCY   (0),
-    .READ_DATA_WIDTH     (AXIS_FIFO_WIDTH),
+    .READ_DATA_WIDTH     (FIFO_W),
     .RD_DATA_COUNT_WIDTH (FIFO_CNT_W),
     .PROG_EMPTY_THRESH   (5),
     .DOUT_RESET_VALUE    ("0"),
@@ -247,13 +270,13 @@ xpm_fifo_sync #(
     .FIFO_MEMORY_TYPE    ("bram"),
     .ECC_MODE            ("no_ecc"),
     .FIFO_WRITE_DEPTH    (FIFO_DEPTH),
-    .WRITE_DATA_WIDTH    (AXIS_FIFO_WIDTH),
+    .WRITE_DATA_WIDTH    (FIFO_W),
     .WR_DATA_COUNT_WIDTH (FIFO_CNT_W),
     .PROG_FULL_THRESH    (PROG_FULL_THRESH_C),
     .FULL_RESET_VALUE    (0),
     .READ_MODE           ("fwft"),
     .FIFO_READ_LATENCY   (0),
-    .READ_DATA_WIDTH     (AXIS_FIFO_WIDTH),
+    .READ_DATA_WIDTH     (FIFO_W),
     .RD_DATA_COUNT_WIDTH (FIFO_CNT_W),
     .PROG_EMPTY_THRESH   (5),
     .DOUT_RESET_VALUE    ("0"),
@@ -290,13 +313,13 @@ xpm_fifo_sync #(
     .FIFO_MEMORY_TYPE    ("bram"),
     .ECC_MODE            ("no_ecc"),
     .FIFO_WRITE_DEPTH    (FIFO_DEPTH),
-    .WRITE_DATA_WIDTH    (AXIS_FIFO_WIDTH),
+    .WRITE_DATA_WIDTH    (FIFO_W),
     .WR_DATA_COUNT_WIDTH (FIFO_CNT_W),
     .PROG_FULL_THRESH    (PROG_FULL_THRESH_C),
     .FULL_RESET_VALUE    (0),
     .READ_MODE           ("fwft"),
     .FIFO_READ_LATENCY   (0),
-    .READ_DATA_WIDTH     (AXIS_FIFO_WIDTH),
+    .READ_DATA_WIDTH     (FIFO_W),
     .RD_DATA_COUNT_WIDTH (FIFO_CNT_W),
     .PROG_EMPTY_THRESH   (5),
     .DOUT_RESET_VALUE    ("0"),
@@ -343,13 +366,13 @@ if (MRD_DED) begin : g_mrd_fifos
         .FIFO_MEMORY_TYPE    ("bram"),
         .ECC_MODE            ("no_ecc"),
         .FIFO_WRITE_DEPTH    (FIFO_DEPTH),
-        .WRITE_DATA_WIDTH    (AXIS_FIFO_WIDTH),
+        .WRITE_DATA_WIDTH    (FIFO_W),
         .WR_DATA_COUNT_WIDTH (FIFO_CNT_W),
         .PROG_FULL_THRESH    (PROG_FULL_THRESH_C),
         .FULL_RESET_VALUE    (0),
         .READ_MODE           ("fwft"),
         .FIFO_READ_LATENCY   (0),
-        .READ_DATA_WIDTH     (AXIS_FIFO_WIDTH),
+        .READ_DATA_WIDTH     (FIFO_W),
         .RD_DATA_COUNT_WIDTH (FIFO_CNT_W),
         .PROG_EMPTY_THRESH   (5),
         .DOUT_RESET_VALUE    ("0"),
@@ -386,13 +409,13 @@ if (MRD_DED) begin : g_mrd_fifos
         .FIFO_MEMORY_TYPE    ("bram"),
         .ECC_MODE            ("no_ecc"),
         .FIFO_WRITE_DEPTH    (FIFO_DEPTH),
-        .WRITE_DATA_WIDTH    (AXIS_FIFO_WIDTH),
+        .WRITE_DATA_WIDTH    (FIFO_W),
         .WR_DATA_COUNT_WIDTH (FIFO_CNT_W),
         .PROG_FULL_THRESH    (PROG_FULL_THRESH_C),
         .FULL_RESET_VALUE    (0),
         .READ_MODE           ("fwft"),
         .FIFO_READ_LATENCY   (0),
-        .READ_DATA_WIDTH     (AXIS_FIFO_WIDTH),
+        .READ_DATA_WIDTH     (FIFO_W),
         .RD_DATA_COUNT_WIDTH (FIFO_CNT_W),
         .PROG_EMPTY_THRESH   (5),
         .DOUT_RESET_VALUE    ("0"),
@@ -429,11 +452,11 @@ end else begin : g_no_mrd_fifos
 
     assign almost_full_3   = 1'b0;
     assign empty_3         = 1'b1;
-    assign fifo_data_out_3 = {AXIS_FIFO_WIDTH{1'b0}};
+    assign fifo_data_out_3 = {FIFO_W{1'b0}};
     assign wr_data_count_3 = {FIFO_CNT_W{1'b0}};
     assign almost_full_4   = 1'b0;
     assign empty_4         = 1'b1;
-    assign fifo_data_out_4 = {AXIS_FIFO_WIDTH{1'b0}};
+    assign fifo_data_out_4 = {FIFO_W{1'b0}};
     assign wr_data_count_4 = {FIFO_CNT_W{1'b0}};
 
 end
@@ -495,33 +518,56 @@ localparam MRD_TYPE = 4'b0000;   // Memory Read   (non-posted, descriptor-only)
 
 // =================================================================
 // FIFO Data Packing
-// Format: { tkeep[TKEEP_WIDTH], tlast[1], sop[1], tuser[AXIS_TUSER_WIDTH], tdata[AXIS_DATA_WIDTH] }
+// Format: { [src[1], ts[TS_W]], tkeep[TKEEP_WIDTH], tlast[1], sop[1], tuser[AXIS_TUSER_WIDTH], tdata[AXIS_DATA_WIDTH] }
+//          (src/ts only when INGRESS_TS = 1)
 //
 // tkeep is carried verbatim through the FIFO.  Straddle is OFF, so per PG343
 // s_axis_tkeep is the authoritative per-DWORD valid indicator for the EOP beat;
 // it must be preserved rather than reconstructed from the straddle-only
 // is_eop0_ptr sideband (which is undriven/0 when straddle is disabled).
+//
+// src/ts stamp each beat with the slave port it arrived on and the value of a
+// free-running cycle counter when it was accepted there.  Every FIFO keeps its
+// entries in order, so whichever path a packet takes, its stamp leaves with it
+// (m_axis_src / m_axis_wait below).
 // =================================================================
-wire [AXIS_FIFO_WIDTH-1:0] pack_ch0;
-wire [AXIS_FIFO_WIDTH-1:0] pack_ch1;
+wire [FIFO_W-1:0] pack_ch0;
+wire [FIFO_W-1:0] pack_ch1;
 
-assign pack_ch0 = {s_axis_tkeep_0, s_axis_tlast_0, sop_0[0], s_axis_tuser_0, s_axis_tdata_0};
-assign pack_ch1 = {s_axis_tkeep_1, s_axis_tlast_1, sop_1[0], s_axis_tuser_1, s_axis_tdata_1};
+wire [AXIS_FIFO_WIDTH-1:0] pack_axis_ch0 = {s_axis_tkeep_0, s_axis_tlast_0, sop_0[0], s_axis_tuser_0, s_axis_tdata_0};
+wire [AXIS_FIFO_WIDTH-1:0] pack_axis_ch1 = {s_axis_tkeep_1, s_axis_tlast_1, sop_1[0], s_axis_tuser_1, s_axis_tdata_1};
+
+// Free-running ingress clock (unused, and trimmed, when INGRESS_TS = 0)
+reg [TS_W-1:0] r_ts_now;
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) r_ts_now <= {TS_W{1'b0}};
+    else        r_ts_now <= r_ts_now + 1'b1;
+end
+
+generate
+if (INGRESS_TS != 0) begin : g_ts_pack
+    assign pack_ch0 = {1'b0, r_ts_now, pack_axis_ch0};
+    assign pack_ch1 = {1'b1, r_ts_now, pack_axis_ch1};
+end else begin : g_no_ts_pack
+    assign pack_ch0 = pack_axis_ch0;
+    assign pack_ch1 = pack_axis_ch1;
+end
+endgenerate
 
 // =================================================================
 // Internal Registers
 // =================================================================
 
 // Registered FIFO write outputs (write enable is a single-cycle pulse)
-reg  [AXIS_FIFO_WIDTH-1:0] r_fifo0_din;
+reg  [FIFO_W-1:0]           r_fifo0_din;
 reg                         r_wr_en_0_r;
-reg  [AXIS_FIFO_WIDTH-1:0] r_fifo1_din;
+reg  [FIFO_W-1:0]           r_fifo1_din;
 reg                         r_wr_en_1_r;
-reg  [AXIS_FIFO_WIDTH-1:0] r_fifo2_din;
+reg  [FIFO_W-1:0]           r_fifo2_din;
 reg                         r_wr_en_2_r;
-reg  [AXIS_FIFO_WIDTH-1:0] r_fifo3_din;
+reg  [FIFO_W-1:0]           r_fifo3_din;
 reg                         r_wr_en_3_r;
-reg  [AXIS_FIFO_WIDTH-1:0] r_fifo4_din;
+reg  [FIFO_W-1:0]           r_fifo4_din;
 reg                         r_wr_en_4_r;
 
 // FIFO 2 packet-ownership lock.
@@ -756,7 +802,7 @@ reg       r_in_pkt;
 
 // --- Mux current FIFO data/empty based on active state ---
 // FIFO packing: { tkeep[TKEEP_WIDTH], tlast[1], sop[1], tuser[AXIS_TUSER_WIDTH], tdata[AXIS_DATA_WIDTH] }
-wire [AXIS_FIFO_WIDTH-1:0] cur_data;
+wire [FIFO_W-1:0]           cur_data;
 wire                        cur_empty;
 
 assign cur_data  = (r_mst_state == MST_SERVE_0) ? fifo_data_out_0 :
@@ -764,7 +810,7 @@ assign cur_data  = (r_mst_state == MST_SERVE_0) ? fifo_data_out_0 :
                    (r_mst_state == MST_SERVE_2) ? fifo_data_out_2 :
                    (r_mst_state == MST_SERVE_3) ? fifo_data_out_3 :
                    (r_mst_state == MST_SERVE_4) ? fifo_data_out_4 :
-                   {AXIS_FIFO_WIDTH{1'b0}};
+                   {FIFO_W{1'b0}};
 
 assign cur_empty = (r_mst_state == MST_SERVE_0) ? empty_0 :
                    (r_mst_state == MST_SERVE_1) ? empty_1 :
@@ -791,6 +837,21 @@ assign m_axis_tdata  = cur_tdata;
 assign m_axis_tkeep  = cur_tkeep;
 assign m_axis_tlast  = cur_tlast;
 assign m_axis_tuser  = cur_tuser;
+
+// --- Ingress sideband (INGRESS_TS = 1) ---
+// Age of the presented beat = ingress clock now - its stamp, saturated to
+// WAIT_W bits.  The difference is modulo 2^TS_W, so only a beat held here for
+// 2^32 cycles or more (seconds at any PCIe user clock) would alias.
+generate
+if (INGRESS_TS != 0) begin : g_ts_out
+    wire [TS_W-1:0] cur_age = r_ts_now - cur_data[AXIS_FIFO_WIDTH +: TS_W];
+    assign m_axis_src  = cur_data[FIFO_W-1];
+    assign m_axis_wait = (|cur_age[TS_W-1:WAIT_W]) ? {WAIT_W{1'b1}} : cur_age[WAIT_W-1:0];
+end else begin : g_no_ts_out
+    assign m_axis_src  = 1'b0;
+    assign m_axis_wait = {WAIT_W{1'b0}};
+end
+endgenerate
 
 // --- FIFO read-enable assignments ---
 // Assert rd_en on the current FIFO whenever a beat is accepted downstream.
@@ -821,15 +882,15 @@ assign rd_en_4 = (r_mst_state == MST_SERVE_4) && cur_fire;
 // =================================================================
 always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-        r_fifo0_din           <= {AXIS_FIFO_WIDTH{1'b0}};
+        r_fifo0_din           <= {FIFO_W{1'b0}};
         r_wr_en_0_r           <= 1'b0;
-        r_fifo1_din           <= {AXIS_FIFO_WIDTH{1'b0}};
+        r_fifo1_din           <= {FIFO_W{1'b0}};
         r_wr_en_1_r           <= 1'b0;
-        r_fifo2_din           <= {AXIS_FIFO_WIDTH{1'b0}};
+        r_fifo2_din           <= {FIFO_W{1'b0}};
         r_wr_en_2_r           <= 1'b0;
-        r_fifo3_din           <= {AXIS_FIFO_WIDTH{1'b0}};
+        r_fifo3_din           <= {FIFO_W{1'b0}};
         r_wr_en_3_r           <= 1'b0;
-        r_fifo4_din           <= {AXIS_FIFO_WIDTH{1'b0}};
+        r_fifo4_din           <= {FIFO_W{1'b0}};
         r_wr_en_4_r           <= 1'b0;
         r_f2_lock             <= 1'b0;
         r_f2_lock_ch          <= 1'b0;

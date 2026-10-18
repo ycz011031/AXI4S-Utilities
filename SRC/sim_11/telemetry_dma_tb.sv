@@ -2,20 +2,21 @@
 // =================================================================
 // telemetry_dma_tb
 //
-// Self-checking testbench for the merged DMA telemetry log of
-// axi4_mwr_batch_top (DMA_LOG = 1): three taps (in0, in1, batched out)
-// merged by axi4_telemetry_logger into one AXI-S stream for the AXI DMA.
+// Self-checking testbench for the DMA telemetry log of axi4_mwr_batch_top
+// (DMA_LOG = 1): one record per TLP leaving the batched output, carrying the
+// cycles it waited in the batcher (pkt_wait) and the input it came from (port).
 //
 // Several top instances with different log stream widths / region sizes /
 // FIFO depths / DMA sink behaviour receive identical stimulus.  Each harness
 //   - monitors in0, in1 and out on the wire and rebuilds the expected record
-//     of every TLP independently of the RTL (length, gap, type, addr, ...),
+//     of every output TLP independently of the RTL (length, gap, type, addr,
+//     ...; pkt_wait = output SOP cycle - input SOP cycle; port = its input),
 //   - models the AXI DMA S2MM sink and splits the log into recordings at tlast,
 //   - checks every recording:
-//       * per port, the n-th logged record is that port's n-th TLP, either
-//         exact (kind TLP) or as a dropped record (kind DROP, zero data)
-//       * TLP records of all ports appear in EOP time order (port order
-//         within a cycle)
+//       * per input port, the n-th logged record is the n-th output TLP from
+//         that input, either exact (kind TLP) or as a dropped record (kind
+//         DROP, zero data)
+//       * TLP records appear in output EOP order; no input-side records
 //       * region full -> exactly N-1 TLP/drop records; otherwise all TLPs
 //       * pad records up to the last slot of a beat, then the trailer
 //       * trailer: n_records, n_dropped, duration, stop reason
@@ -29,7 +30,8 @@
 //   xvlog -sv SRC/sources_1/axi4_telemetry.v SRC/sources_1/axi4_telemetry_logger.v \
 //         SRC/sources_1/axi4_mwr_batch.v SRC/sources_1/axi4_mwr_batch_top.v \
 //         SRC/sim_11/telemetry_dma_tb.sv <vivado>/data/verilog/src/glbl.v
-//   xelab work.telemetry_dma_tb work.glbl -L xpm -L unisims_ver --snapshot tel_dma_sim
+//   xelab work.telemetry_dma_tb work.glbl -L xpm -L unisims_ver --snapshot tel_dma_sim \
+//         --timescale 1ns/1ps
 //   xsim tel_dma_sim -runall
 // =================================================================
 
@@ -103,11 +105,17 @@ module tel_top_harness #(
     int errors = 0;
 
     // ---------------- Bus monitors: expected records ----------------
+    // The input monitors note the cycle each TLP's SOP is accepted, keyed by
+    // its descriptor address (unique per TLP in this TB).  The output monitor
+    // rebuilds the record of every TLP leaving the batcher from that.
     longint cyc = 0;
-    longint       exp_cyc[$];   // per expected TLP: EOP cycle
-    int           exp_port[$];  // 0 = in0, 1 = in1, 2 = out
-    logic [111:0] exp_data[$];  // expected record bytes 0..13
+    longint       exp_cyc[$];   // per expected output TLP: EOP cycle
+    int           exp_port[$];  // input it came from: 0 = in0, 1 = in1
+    logic [119:0] exp_data[$];  // expected record bytes {15, 13..0}
     // (parallel queues: xsim 2021.2 crashes reading fields of a struct queue)
+
+    longint       in_sop_cyc  [longint];   // descriptor address -> input SOP cycle
+    int           in_sop_port [longint];   // descriptor address -> input port
 
     bit           in_pkt   [3];
     bit           have_eop [3];
@@ -115,17 +123,19 @@ module tel_top_harness #(
     int           beats    [3];
     int           gap      [3];
     logic [DW-1:0] sop_d   [3];
+    longint       out_wait;                // of the output TLP in flight
+    int           out_src;
 
-    function automatic logic [111:0] make_rec(logic [DW-1:0] d, int len, int g);
-        logic [111:0] r = '0;
+    function automatic logic [119:0] make_rec(logic [DW-1:0] d, int len, int g, longint w);
+        logic [119:0] r = '0;
         int dwc = d[74:64];
         r[63:0]    = {d[63:2], 2'b00};
         r[71:64]   = (len > 255) ? 255 : len;
         r[79:72]   = (g > 255) ? 255 : g;
-        r[87:80]   = {4'd0, d[78:75]};
+        r[87:80]   = {2'd0, d[1:0], d[78:75]};
         r[95:88]   = (d[78:75] == 4'b0001) ? ((dwc > 255) ? 255 : dwc) : 0;
-        r[103:96]  = d[103:96];
-        r[111:104] = {6'd0, d[1:0]};
+        r[111:96]  = (w > 65535) ? 65535 : w;
+        r[119:112] = d[103:96];
         return r;
     endfunction
 
@@ -138,6 +148,7 @@ module tel_top_harness #(
         end else begin
             logic          v [3], l [3];
             logic [DW-1:0] d [3];
+            longint        a;
             cyc = cyc + 1;
             v[0] = tvalid_0 && tready_0;     l[0] = tlast_0;   d[0] = tdata_0;
             v[1] = tvalid_1 && tready_1;     l[1] = tlast_1;   d[1] = tdata_1;
@@ -145,16 +156,30 @@ module tel_top_harness #(
             for (int p = 0; p < 3; p++) begin
                 if (v[p]) begin
                     if (!in_pkt[p]) begin
+                        a         = longint'(d[p][63:2]);
                         in_pkt[p] = 1;
                         beats[p]  = 0;
                         sop_d[p]  = d[p];
                         gap[p]    = have_eop[p] ? int'(cyc - last_eop[p] - 1) : 0;
+                        if (p < 2) begin
+                            in_sop_cyc[a]  = cyc;
+                            in_sop_port[a] = p;
+                        end else if (!in_sop_cyc.exists(a)) begin
+                            err($sformatf("output TLP %h never seen on an input", a));
+                            out_wait = 0;
+                            out_src  = 0;
+                        end else begin
+                            out_wait = cyc - in_sop_cyc[a];
+                            out_src  = in_sop_port[a];
+                        end
                     end
                     beats[p]++;
                     if (l[p]) begin
-                        exp_cyc.push_back(cyc);
-                        exp_port.push_back(p);
-                        exp_data.push_back(make_rec(sop_d[p], beats[p], gap[p]));
+                        if (p == 2) begin
+                            exp_cyc.push_back(cyc);
+                            exp_port.push_back(out_src);
+                            exp_data.push_back(make_rec(sop_d[p], beats[p], gap[p], out_wait));
+                        end
                         in_pkt[p]   = 0;
                         have_eop[p] = 1;
                         last_eop[p] = cyc;
@@ -209,6 +234,10 @@ module tel_top_harness #(
     end
 
     // ---------------- Checker ----------------
+    int n_wait_sat = 0;       // logged TLP records with pkt_wait saturated (coverage)
+    int max_wait   = 0;       // largest unsaturated pkt_wait logged
+    int min_wait   = 65535;   // smallest pkt_wait logged
+
     function automatic void err(string msg);
         if (errors < 25) $display("ERROR [%s] %s", NAME, msg);
         errors++;
@@ -224,8 +253,8 @@ module tel_top_harness #(
         for (int s = 0; s < ws.size(); s++) begin
             int   E[$];                       // indices into exp_* of this recording
             int   n_e, n_rec, pad, exp_total, got, exp_reason;
-            int   pidx[3], pcnt[3], pmap[];   // pmap[p*n_rec + k] = E index of port p's k-th TLP
-            int   last_tlp, drops, per_port_tlp[3], per_port_drop[3];
+            int   pidx[2], pcnt[2], pmap[];   // pmap[p*n_rec + k] = E index of port p's k-th TLP
+            int   last_tlp, drops, per_port_tlp[2], per_port_drop[2];
             rec_t tr;
 
             // xsim does not re-run initialisers of loop-local variables: reset explicitly
@@ -241,8 +270,8 @@ module tel_top_harness #(
             pad        = (K - 1) - (n_rec % K);
             exp_total  = n_rec + pad + 1;
             got        = sess_end[s] - base;
-            pmap       = new[3*n_rec + 1];
-            for (int p = 0; p < 3; p++) begin
+            pmap       = new[2*n_rec + 1];
+            for (int p = 0; p < 2; p++) begin
                 pidx[p] = 0; pcnt[p] = 0; per_port_tlp[p] = 0; per_port_drop[p] = 0;
             end
             for (int i = 0; i < n_rec; i++) begin
@@ -260,14 +289,15 @@ module tel_top_harness #(
             for (int j = 0; j < n_rec; j++) begin
                 rec_t r;
                 int   info, kind, port, ei;
-                logic [111:0] ed;
+                logic [119:0] ed, gd;
                 r    = recs[base + j];
                 info = r[119:112];
                 kind = r[115:114];
                 port = r[113:112];
-                if (r[119] !== 1'b1 || r[118:116] !== 3'd0 || r[127:120] !== 8'd0)
-                    err($sformatf("rec %0d slot %0d: bad info/reserved bytes %h", s, j, r));
-                if (port > 2 || kind > 1) begin
+                gd   = {r[127:120], r[111:0]};
+                if (r[119] !== 1'b1 || r[118:116] !== 3'd0)
+                    err($sformatf("rec %0d slot %0d: bad info byte %h", s, j, r));
+                if (port > 1 || kind > 1) begin
                     err($sformatf("rec %0d slot %0d: kind %0d port %0d not a TLP/drop", s, j, kind, port));
                 end else if (pidx[port] >= pcnt[port]) begin
                     err($sformatf("rec %0d slot %0d: extra record for port %0d", s, j, port));
@@ -277,22 +307,25 @@ module tel_top_harness #(
                     if (kind == 0) begin
                         per_port_tlp[port]++;
                         ed = exp_data[E[ei]];
-                        if (r[111:0] !== ed)
+                        if (gd !== ed)
                             err($sformatf("rec %0d slot %0d port %0d: got %h exp %h",
-                                          s, j, port, r[111:0], ed));
+                                          s, j, port, gd, ed));
                         if (ei < last_tlp)
                             err($sformatf("rec %0d slot %0d: TLP out of EOP order (%0d after %0d)",
                                           s, j, ei, last_tlp));
                         last_tlp = ei;
+                        if (gd[111:96] == 16'hFFFF)     n_wait_sat++;
+                        else if (gd[111:96] > max_wait) max_wait = gd[111:96];
+                        if (gd[111:96] < min_wait)      min_wait = gd[111:96];
                     end else begin
                         per_port_drop[port]++;
                         drops++;
-                        if (r[111:0] !== 112'd0)
+                        if (gd !== 120'd0)
                             err($sformatf("rec %0d slot %0d: dropped record data not zero", s, j));
                     end
                 end
             end
-            for (int p = 0; p < 3; p++)
+            for (int p = 0; p < 2; p++)
                 if (pidx[p] != pcnt[p])
                     err($sformatf("rec %0d: port %0d logged %0d records, expected %0d",
                                   s, p, pidx[p], pcnt[p]));
@@ -322,9 +355,9 @@ module tel_top_harness #(
             if (sess_reason[s] != exp_reason)
                 err($sformatf("rec %0d: log_stop_reason %0d, expected %0d", s, sess_reason[s], exp_reason));
 
-            $display("  [%s] rec %0d: %0d TLPs (in0/in1/out %0d/%0d/%0d), logged %0d, dropped %0d (%0d/%0d/%0d), pad %0d, reason %s, dur %0d",
-                     NAME, s, n_e, pcnt[0], pcnt[1], pcnt[2], got,
-                     drops, per_port_drop[0], per_port_drop[1], per_port_drop[2], pad,
+            $display("  [%s] rec %0d: %0d output TLPs (from in0/in1 %0d/%0d), logged %0d, dropped %0d (%0d/%0d), pad %0d, reason %s, dur %0d",
+                     NAME, s, n_e, pcnt[0], pcnt[1], got,
+                     drops, per_port_drop[0], per_port_drop[1], pad,
                      (exp_reason == 1) ? "enable" : "full", tr[95:64]);
             base = sess_end[s];
         end
@@ -348,10 +381,11 @@ module telemetry_dma_tb;
     reg              out_tready = 0;
     reg              log_enable = 0;
     reg              stall = 0;
+    reg              hold_out = 0;     // hold the batched output off (pkt_wait saturation)
 
     always #2 clk = ~clk;
 
-    always @(posedge clk) out_tready <= ($urandom_range(99) < 85);
+    always @(posedge clk) out_tready <= !hold_out && ($urandom_range(99) < 85);
 
     // ---------------- DUT harnesses ----------------
     `define HARNESS(inst, FIFO, REGION, W, RDY, NM) \
@@ -569,6 +603,19 @@ module telemetry_dma_tb;
         disarm();
         wait_idle();
 
+        $display("Scenario G: output held off for 70000 cycles - pkt_wait saturates");
+        arm();
+        @(posedge clk); hold_out <= 1'b1;
+        fork
+            traffic(4, 3, 2);                // stalls at the input once the FIFOs back up
+            begin
+                repeat (70000) @(posedge clk);
+                hold_out <= 1'b0;
+            end
+        join
+        disarm();
+        wait_idle();
+
         // ---------------- Checks ----------------
         $display("---------------- results ----------------");
         h0.check_all(ws, we, dur);
@@ -583,6 +630,12 @@ module telemetry_dma_tb;
             end
         if (h0.sess_drops.size() > d_sess && h0.sess_drops[d_sess] == 0) begin
             $display("ERROR h0 did not overflow in scenario D (coverage)");
+            tb_errors++;
+        end
+        $display("  pkt_wait (h2): min %0d, max unsaturated %0d cycles, %0d saturated records",
+                 h2.min_wait, h2.max_wait, h2.n_wait_sat);
+        if (h2.n_wait_sat == 0 || h2.max_wait <= 6) begin
+            $display("ERROR pkt_wait coverage: no saturated wait, or none past time_threshold");
             tb_errors++;
         end
 

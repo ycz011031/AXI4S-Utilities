@@ -9,10 +9,11 @@ module axi4_telemetry #(
 
     // --- DMA logging mode (see telemetry_dma_format.md) ---
     // 0 = legacy ILA mode: BRAM ring + cyclic playback into ila_0.
-    // 1 = DMA mode: the module becomes a record tap.  One 14-byte record per TLP
-    //     is presented on log_rec_valid/log_rec_data for axi4_telemetry_logger,
-    //     which merges taps and streams them to an external AXI DMA.  The ILA
-    //     and the playback ring are not built.
+    // 1 = DMA mode: the module becomes a record tap.  One record per TLP (15
+    //     bytes; the logger adds the 16th, the info byte) is presented on
+    //     log_rec_valid/log_rec_data for axi4_telemetry_logger, which merges
+    //     taps and streams them to an external AXI DMA.  The ILA and the
+    //     playback ring are not built.
     parameter         DMA_LOG          = 0
 )(
     input wire                          clk,
@@ -34,11 +35,18 @@ module axi4_telemetry #(
     output wire [AXIS_TUSER_WIDTH-1:0]   m_axis_tuser,
     input  wire                          m_axis_tready,
 
+    // Packet sideband for the DMA record (DMA_LOG = 1), sampled on the SOP
+    // beat alongside the descriptor fields.  Tie to 0 where there is none.
+    input  wire [15:0]                   s_axis_wait,    // cycles the packet waited upstream -> pkt_wait
+    input  wire [1:0]                    s_axis_src,     // source id, returned with the record on log_rec_src
+
     // Record tap (DMA_LOG = 1; tied low when DMA_LOG = 0).  log_rec_valid pulses
-    // for one cycle per TLP, the cycle after its EOP beat; log_rec_data holds
-    // record bytes 0..13 (telemetry_dma_format.md §3), byte 0 in [7:0].
+    // for one cycle per TLP, the cycle after its EOP beat.  log_rec_data holds
+    // record bytes {15, 13..0} (telemetry_dma_format.md §4), byte 0 in [7:0]
+    // and byte 15 in [119:112]; byte 14 (info) is the logger's.
     output wire                          log_rec_valid,
-    output wire [111:0]                  log_rec_data
+    output wire [119:0]                  log_rec_data,
+    output wire [1:0]                    log_rec_src
 );
 
 // =================================================================
@@ -165,6 +173,8 @@ reg [61:0]               r_cur_pkt_addr;     // Full Address[61:0] (DWORD addres
 reg [7:0]                r_cur_pkt_tag;
 reg [1:0]                r_cur_addr_type;
 reg [10:0]               r_cur_dword_count;
+reg [15:0]               r_cur_wait;         // s_axis_wait at SOP (DMA record only)
+reg [1:0]                r_cur_src;          // s_axis_src at SOP  (DMA record only)
 
 // Telemetry buffer storage - SINGLE PACKED BRAM
 // Packing format (LSB to MSB):
@@ -324,6 +334,8 @@ wire [61:0] eff_pkt_addr = is_sop ? address_full : r_cur_pkt_addr;
 wire [7:0]  eff_pkt_tag  = is_sop ? tag          : r_cur_pkt_tag;
 wire [1:0]  eff_addr_typ = is_sop ? address_type : r_cur_addr_type;
 wire [10:0] eff_dw_count = is_sop ? dword_count  : r_cur_dword_count;
+wire [15:0] eff_wait     = is_sop ? s_axis_wait  : r_cur_wait;
+wire [1:0]  eff_src      = is_sop ? s_axis_src   : r_cur_src;
 
 // Per-packet values recorded at EOP (shared by the ILA ring and the DMA log).
 // Beat count: include the EOP beat itself (+1), except for single-beat
@@ -358,6 +370,8 @@ always @(posedge clk or negedge rst_n) begin
         r_cur_pkt_tag     <= 8'd0;
         r_cur_addr_type   <= 2'd0;
         r_cur_dword_count <= 11'd0;
+        r_cur_wait        <= 16'd0;
+        r_cur_src         <= 2'd0;
         r_write_ptr       <= {ADDR_WIDTH{1'b0}};
         r_valid_count     <= {ADDR_WIDTH{1'b0}};
         r_total_pkts      <= {DATA_FIDELITY{1'b0}};
@@ -385,7 +399,9 @@ always @(posedge clk or negedge rst_n) begin
             r_cur_pkt_tag     <= tag;
             r_cur_addr_type   <= address_type;
             r_cur_dword_count <= dword_count;
-            
+            r_cur_wait        <= s_axis_wait;
+            r_cur_src         <= s_axis_src;
+
             // Capture the full address for all packet types
             r_cur_pkt_addr <= address_full;
                 
@@ -625,42 +641,48 @@ end
 //
 // One record per TLP, registered: log_rec_valid pulses the cycle after the
 // EOP beat.  axi4_telemetry_logger merges taps, adds the source/kind byte and
-// streams the records to the AXI DMA.  Layout: telemetry_dma_format.md §3.
+// streams the records to the AXI DMA.  Layout: telemetry_dma_format.md §4.
 // =================================================================
 
-// Record bytes 0..13, little-endian (byte 0 = [7:0]).
+// Record bytes {15, 13..0}, little-endian (byte 0 = [7:0]).
 // Byte-sized fields assume DATA_FIDELITY == 8 (as does the ILA ring layout).
-wire [111:0] eop_rec_data = {
-    {6'd0, eff_addr_typ},     // byte  13      addr_type
-    eff_pkt_tag,              // byte  12      pkt_tag
-    eop_payload_dw,           // byte  11      payload_dw
-    {4'd0, eff_pkt_type},     // byte  10      pkt_type
-    r_gap_count,              // byte   9      pkt_gap
-    eop_pkt_length,           // byte   8      pkt_length
-    {eff_pkt_addr, 2'b00}     // bytes  7..0   pkt_addr (byte address)
+wire [119:0] eop_rec_data = {
+    eff_pkt_tag,                         // byte  15      pkt_tag
+    eff_wait,                            // bytes 12..13  pkt_wait
+    eop_payload_dw,                      // byte  11      payload_dw
+    {2'd0, eff_addr_typ, eff_pkt_type},  // byte  10      pkt_type: [3:0] type, [5:4] addr_type
+    r_gap_count,                         // byte   9      pkt_gap
+    eop_pkt_length,                      // byte   8      pkt_length
+    {eff_pkt_addr, 2'b00}                // bytes  7..0   pkt_addr (byte address)
 };
 
 generate
 if (DMA_LOG == 1) begin : gen_log_tap
     reg         r_tap_valid;
-    reg [111:0] r_tap_data;
+    reg [119:0] r_tap_data;
+    reg [1:0]   r_tap_src;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             r_tap_valid <= 1'b0;
-            r_tap_data  <= 112'd0;
+            r_tap_data  <= 120'd0;
+            r_tap_src   <= 2'd0;
         end else begin
             r_tap_valid <= is_eop;
-            if (is_eop)
+            if (is_eop) begin
                 r_tap_data <= eop_rec_data;
+                r_tap_src  <= eff_src;
+            end
         end
     end
 
     assign log_rec_valid = r_tap_valid;
     assign log_rec_data  = r_tap_data;
+    assign log_rec_src   = r_tap_src;
 end else begin : gen_no_log_tap
     assign log_rec_valid = 1'b0;
-    assign log_rec_data  = 112'd0;
+    assign log_rec_data  = 120'd0;
+    assign log_rec_src   = 2'd0;
 end
 endgenerate
 
